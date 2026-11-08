@@ -1,0 +1,25 @@
+[project]
+name = "hello"
+version = "0.1.0"
+out_dir = "build"
+
+[build]
+profile = "debug"
+cache = true
+timings = false
+
+[target.app]
+kind = "exe"
+sources = ["src/**/*.c"]
+include = ["include"]
+links = ["core"]
+
+[target.core]
+kind = "staticlib"
+sources = ["core/*.c"]
+include = ["core/include"]
+
+[profiles.release]
+opt = 2
+debug = false
+cflags = ["-Wall", "-Wextra"]

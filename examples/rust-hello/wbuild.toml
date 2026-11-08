@@ -1,0 +1,9 @@
+[project]
+name = "rusthello"
+out_dir = "build"
+
+[target.app]
+kind = "rust"
+sources = ["src/main.rs"]
+edition = "2021"
+target = "x86_64-pc-windows-gnu"

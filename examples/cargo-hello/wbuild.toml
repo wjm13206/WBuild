@@ -1,0 +1,7 @@
+[project]
+name = "cargohello"
+out_dir = "build"
+
+[target.app]
+kind = "cargo"
+manifest = "crate/Cargo.toml"
