@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the stable channel and required components;
+      # rustup picks it up automatically.
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked --verbose
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --verbose
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: wbuild-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            target/release/wbuild
+            target/release/wbuild.exe
+          if-no-files-found: error
+          retention-days: 7
