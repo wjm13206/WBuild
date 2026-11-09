@@ -296,11 +296,28 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
             if deps_fingerprint(&entry.deps, ctx) != entry.hash {
                 continue;
             }
+            if entry.extras.len() != step.extra_outputs.len() {
+                continue;
+            }
             let Some(cached) = ctx.cache.artifact(&entry.entry, step.cache_ext) else {
                 continue;
             };
-            match restore_cached(step, &cached, &ctx.root) {
-                Ok(()) => {
+            let mut cached_extras = Vec::with_capacity(entry.extras.len());
+            let mut extras_ok = true;
+            for fingerprint in &entry.extras {
+                match ctx.cache.artifact(fingerprint, step.cache_ext) {
+                    Some(path) => cached_extras.push(path),
+                    None => {
+                        extras_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !extras_ok {
+                continue;
+            }
+            match restore_cached(step, &cached, &cached_extras) {
+                Ok(()) if outputs_exist(step) => {
                     let fp_post = if entry.deps.as_slice() == prev_deps {
                         fp_pre.clone()
                     } else {
@@ -311,6 +328,9 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
                     outcome.fingerprint = fp_post;
                     outcome.deps = entry.deps;
                     return outcome;
+                }
+                Ok(()) => {
+                    // Restored files did not land where the step expects them.
                 }
                 Err(err) => {
                     // Corrupt/unreadable cache entry: fall through to a real build.
@@ -397,19 +417,37 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
     };
 
     if let Some(command_fp) = &command_fp {
+        let mut extras = Vec::new();
+        let mut extras_ok = true;
+        for (index, extra) in step.extra_outputs.iter().enumerate() {
+            let fingerprint = format!("{fp_post}-x{index}");
+            match ctx.cache.store(&fingerprint, step.cache_ext, extra) {
+                Ok(()) => extras.push(fingerprint),
+                Err(err) => {
+                    extras_ok = false;
+                    if ctx.options.verbose {
+                        eprintln!("warning: {err:#}");
+                    }
+                    break;
+                }
+            }
+        }
         if let Err(err) = ctx.cache.store(&fp_post, step.cache_ext, &step.output) {
             if ctx.options.verbose {
                 eprintln!("warning: {err:#}");
             }
         }
-        let entry = crate::cache::CacheEntry {
-            hash: deps_fingerprint(&deps, ctx),
-            deps: deps.clone(),
-            entry: fp_post.clone(),
-        };
-        if let Err(err) = ctx.cache.upsert(command_fp, entry) {
-            if ctx.options.verbose {
-                eprintln!("warning: {err:#}");
+        if extras_ok {
+            let entry = crate::cache::CacheEntry {
+                hash: deps_fingerprint(&deps, ctx),
+                deps: deps.clone(),
+                entry: fp_post.clone(),
+                extras,
+            };
+            if let Err(err) = ctx.cache.upsert(command_fp, entry) {
+                if ctx.options.verbose {
+                    eprintln!("warning: {err:#}");
+                }
             }
         }
     }
@@ -431,11 +469,17 @@ fn outputs_exist(step: &Step) -> bool {
 }
 
 fn ensure_parents(step: &Step) -> std::io::Result<()> {
+    fs::create_dir_all(&step.workdir)?;
     if let Some(parent) = step.output.parent() {
         fs::create_dir_all(parent)?;
     }
     for extra in &step.extra_outputs {
         if let Some(parent) = extra.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    if let Some(stdout) = &step.stdout {
+        if let Some(parent) = stdout.parent() {
             fs::create_dir_all(parent)?;
         }
     }
@@ -455,6 +499,10 @@ fn run_command(step: &Step) -> std::io::Result<std::process::Output> {
         cmd.env(k, v);
     }
     cmd.stdin(std::process::Stdio::null());
+    if let Some(stdout) = &step.stdout {
+        let file = fs::File::create(stdout)?;
+        cmd.stdout(std::process::Stdio::from(file));
+    }
     cmd.output()
 }
 
@@ -468,9 +516,11 @@ fn copy_step(step: &Step) -> Result<()> {
     Ok(())
 }
 
-fn restore_cached(step: &Step, cached: &Path, root: &Path) -> Result<()> {
-    let _ = root;
+fn restore_cached(step: &Step, cached: &Path, cached_extras: &[PathBuf]) -> Result<()> {
     util::atomic_copy(cached, &step.output)?;
+    for (extra, cached_extra) in step.extra_outputs.iter().zip(cached_extras) {
+        util::atomic_copy(cached_extra, extra)?;
+    }
     // Only executables need the extra permission bit; setting it on objects is
     // harmless on Unix.
     if matches!(step.kind, StepKind::Link | StepKind::Rustc) {
@@ -482,7 +532,7 @@ fn restore_cached(step: &Step, cached: &Path, root: &Path) -> Result<()> {
 /// Compute the fingerprint for a step given its dependency set (stored paths).
 fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext<'_>) -> Result<String> {
     let mut fp = Fingerprint::new().tag("wbuild-step-v2");
-    fp.text(&ctx.toolchain_fp);
+    fp.text(step.toolchain_fp.as_deref().unwrap_or(&ctx.toolchain_fp));
     fp.text(step.kind.tag());
     fp.path(&step.program);
     fp.args(&step.args);
@@ -490,7 +540,14 @@ fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext<'_>) -> R
         fp.text(key);
         fp.text(value);
     }
+    fp.path(&step.workdir);
     fp.path(&step.output);
+    for extra in &step.extra_outputs {
+        fp.path(extra);
+    }
+    if let Some(stdout) = &step.stdout {
+        fp.path(stdout);
+    }
     for input in &step.inputs {
         fp.path(input);
         fp.text(&ctx.hasher.hash_opt(input));

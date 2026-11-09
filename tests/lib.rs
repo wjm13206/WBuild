@@ -155,6 +155,58 @@ fn selecting_a_target_prunes_unrelated_work() {
 }
 
 #[test]
+fn named_outputs_and_declared_programs_are_plannable() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("wbuild.toml"),
+        r#"
+[project]
+name = "named"
+
+[target.gen]
+kind = "custom"
+program = "cargo"
+args = ["--version"]
+outputs = ["gen/a.txt", "gen/b.o"]
+
+[target.runner]
+kind = "custom"
+program = "gen/a.txt"
+links = ["gen"]
+outputs = ["runner.txt"]
+
+[target.consumer]
+kind = "custom"
+program = "cargo"
+args = ["--version"]
+links = ["gen:gen/b.o"]
+outputs = ["consumer.txt"]
+"#,
+    );
+    let loaded = Config::load(Some(&dir.path().join("wbuild.toml"))).unwrap();
+    let profile = loaded.config.resolve_profile("debug").unwrap();
+    let tc = Toolchain::detect(&loaded.config.compiler, &loaded.root).unwrap();
+
+    let plan = Planner::build(&loaded, &profile, &tc, &["consumer".to_string()]).unwrap();
+    assert!(plan.artifacts.contains_key("gen"));
+    assert!(plan.artifacts.contains_key("consumer"));
+    assert!(!plan.artifacts.contains_key("runner"));
+    assert!(plan.named.contains_key("gen:gen/b.o"));
+    assert!(plan.named.contains_key("gen:b.o"));
+    let consumer = plan
+        .steps
+        .iter()
+        .find(|step| step.target == "consumer")
+        .unwrap();
+    assert_eq!(consumer.deps.len(), 1);
+
+    // A custom `program` may point at another target's declared output even
+    // though the file does not exist yet.
+    let plan = Planner::build(&loaded, &profile, &tc, &["runner".to_string()]).unwrap();
+    assert!(plan.artifacts.contains_key("runner"));
+}
+
+#[test]
 fn cache_roundtrips_and_deduplicates_variants() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join(".wbuild");
@@ -175,6 +227,7 @@ fn cache_roundtrips_and_deduplicates_variants() {
         hash: hash.to_string(),
         deps: vec![format!("{hash}.h")],
         entry: fingerprint.clone(),
+        extras: Vec::new(),
     };
     cache.upsert("cmd", entry("dep-a")).unwrap();
     cache.upsert("cmd", entry("dep-b")).unwrap();

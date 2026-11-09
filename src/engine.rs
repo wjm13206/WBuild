@@ -649,6 +649,16 @@ pub fn is_link_step(kind: StepKind) -> bool {
 
 fn target_is_runnable(target: &Target) -> bool {
     match target.kind {
+        Kind::Exe | Kind::Cargo | Kind::Custom => true,
+        Kind::Rust => matches!(target.crate_type.as_deref(), None | Some("bin")),
+        _ => false,
+    }
+}
+
+/// Targets that produce a directly executable artifact (as opposed to a custom
+/// target, whose `program` is executed instead).
+fn target_has_artifact(target: &Target) -> bool {
+    match target.kind {
         Kind::Exe | Kind::Cargo => true,
         Kind::Rust => matches!(target.crate_type.as_deref(), None | Some("bin")),
         _ => false,
@@ -657,7 +667,7 @@ fn target_is_runnable(target: &Target) -> bool {
 
 fn default_runnable_target(loaded: &LoadedConfig) -> Result<String> {
     for (name, target) in &loaded.config.target {
-        if target_is_runnable(target) {
+        if target_has_artifact(target) {
             return Ok(name.clone());
         }
     }
@@ -703,6 +713,49 @@ pub fn run(loaded: &LoadedConfig, req: &BuildRequest, args: &[String]) -> Result
         );
     }
 
+    if target.kind == Kind::Custom {
+        // Build only the custom target's dependencies, then run its program
+        // with the configured arguments. Running the custom step itself would
+        // execute the program twice (once during the build, once here).
+        let mut dep_req = req.clone();
+        dep_req.targets = target.links.clone();
+        if !dep_req.targets.is_empty() {
+            let summary = build(loaded, &dep_req)?;
+            if !summary.success() {
+                return Ok(1);
+            }
+        }
+        if req.dry_run {
+            return Ok(0);
+        }
+        let compiler = crate::plan::compiler_for(loaded, target)?;
+        let extra_paths: Vec<PathBuf> = compiler
+            .extra_paths
+            .iter()
+            .map(|path| util::abs_path(&loaded.root, path))
+            .collect();
+        let program_text = target
+            .program
+            .as_deref()
+            .context("custom target requires `program`")?;
+        let program = crate::plan::resolve_program(loaded, program_text, &extra_paths)?;
+        let workdir = target
+            .workdir
+            .as_ref()
+            .map(|dir| util::abs_path(&loaded.root, dir))
+            .unwrap_or_else(|| loaded.root.clone());
+        println!("running {} {}", selected, program.display());
+        let mut command = Command::new(&program);
+        command.args(&target.args).args(args).current_dir(&workdir);
+        for (key, value) in &target.env {
+            command.env(key, value);
+        }
+        let status = command
+            .status()
+            .with_context(|| format!("cannot execute `{}`", program.display()))?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
     let summary = build(loaded, req)?;
     if !summary.success() {
         return Ok(1);
@@ -737,7 +790,7 @@ pub fn test(loaded: &LoadedConfig, req: &BuildRequest) -> Result<i32> {
         .config
         .target
         .iter()
-        .filter(|(_, target)| target.test && target_is_runnable(target))
+        .filter(|(_, target)| target.test && target_has_artifact(target))
         .map(|(name, _)| name.clone())
         .collect();
     if names.is_empty() {
@@ -831,11 +884,17 @@ pub fn configure(loaded: &LoadedConfig, requested: Option<&str>) -> Result<()> {
             tags.push("test");
         }
         let detail = match target.kind {
-            Kind::Custom => format!(
-                "{} -> {}",
-                target.program.as_deref().unwrap_or("<missing program>"),
-                target.outputs.join(", ")
-            ),
+            Kind::Custom => {
+                let mut outputs = target.outputs.clone();
+                if let Some(stdout) = &target.stdout {
+                    outputs.push(format!("{stdout} (stdout)"));
+                }
+                format!(
+                    "{} -> {}",
+                    target.program.as_deref().unwrap_or("<missing program>"),
+                    outputs.join(", ")
+                )
+            }
             Kind::Cargo => target
                 .manifest
                 .clone()

@@ -31,7 +31,8 @@ Finished 5 built in 514ms
 - **本地缓存**：内容寻址对象缓存，`wbuild clean` 后仍可复用；缓存键与依赖哈希分离，回退源码/头文件也能命中已有产物。
 - **自动依赖追踪**：GCC/Clang 使用 `-MMD -MF -MP`，MSVC 使用 `/showIncludes`，rustc 使用 `--emit=dep-info`。
 - **多目标**：`exe`、`staticlib`、`sharedlib`、`object`、`custom`、`rust`、`cargo`，目标之间用 `links` 表达依赖、链接顺序与头文件传递。
-- **工具链管理**：自动探测 GCC、Clang、MSVC、rustc、cargo、ar、NASM，并支持显式路径和环境变量覆盖。
+- **工具链管理**：自动探测 GCC、Clang、MSVC、rustc、cargo、ar、NASM，支持显式路径、环境变量覆盖，以及按目标选择 `[toolchain.<name>]` 预设或 `compiler = "musl-gcc"`。
+- **灵活的自定义步骤**：`custom` 目标支持 `workdir`、`stdout` 重定向、多产物具名引用，`wbuild run` 可直接运行其 `program`。
 - **可诊断**：`--explain`、`--dry-run`、`--print-commands`、`--timings`、`wbuild doctor`、`wbuild graph`、`wbuild profile`、`wbuild cache`。
 - **跨平台**：Windows / Linux / macOS；支持交叉编译目标三元组与 sysroot。
 - **无 Shell**：命令始终以 `Command::new(program).args(args)` 执行，参数不会被二次解析，跨平台且安全。
@@ -68,7 +69,7 @@ wbuild build -p release     # 优化构建
 | --- | --- |
 | `wbuild build [TARGET...]` | 构建全部或指定目标 |
 | `wbuild rebuild [TARGET...]` | 先清理再构建 |
-| `wbuild run [TARGET] -- [ARGS...]` | 构建后运行可执行产物，`--` 之后的参数原样传入 |
+| `wbuild run [TARGET] -- [ARGS...]` | 构建后运行可执行产物；`custom` 目标则先构建其 `links`，再运行 `program + args`，`--` 之后的参数原样传入 |
 | `wbuild test [TARGET...]` | 构建并运行所有 `test = true` 的目标 |
 | `wbuild clean [--all]` | 删除输出目录；`--all` 同时删除状态与缓存 |
 | `wbuild list` | 列出目标与依赖 |
@@ -121,6 +122,25 @@ wbuild build -p release     # 优化构建
 
 工具探测顺序：环境变量 `WBUILD_CC`、`WBUILD_CXX`、`WBUILD_RUSTC`、`WBUILD_ASM`、`WBUILD_AR`、`WBUILD_LINKER` → 配置中的显式路径 → `extra_paths` → `PATH`。交叉编译时会优先尝试带三元组前缀的工具（如 `aarch64-linux-gnu-gcc`）。
 
+### `[toolchain.<name>]`
+
+可复用的工具链预设。目标通过 `toolchain = "<name>"` 选择；未设置的字段沿用全局 `[compiler]`。
+
+```toml
+[toolchain.musl]
+compiler = "musl-gcc"       # 同时设置 cc 与 linker，并推导 cxx
+target = "x86_64-linux-musl"
+sysroot = "/opt/musl"
+
+[target.linux_app]
+kind = "exe"
+sources = ["userland/linux/*.c"]
+toolchain = "musl"
+ldflags = ["-static-pie"]
+```
+
+字段：`compiler`（`cc` + `linker` 简写）、`cc`、`cxx`、`rustc`、`asm`、`ar`、`linker`、`target`、`sysroot`、`extra_paths`。每个目标也可以直接写 `compiler = "musl-gcc"` 或 `cc`/`cxx`/`linker` 等字段覆盖单个工具；不同工具链的指纹相互独立，切换工具会触发对应的重建。
+
 ### `[profiles.<name>]`
 
 内置 `debug`（`-O0 -g`）与 `release`（`-O2`、无调试信息、定义 `NDEBUG`）。自定义配置可通过 `extends` 继承。
@@ -147,8 +167,14 @@ wbuild build -p release     # 优化构建
 | `libs` | `[]` | 系统库，如 `["m", "pthread"]` |
 | `lib_dirs` | `[]` | 系统库搜索目录 |
 | `cxx_std` | 无 | C++ 标准，如 `"17"`、`"20"` |
-| `output` | 自动 | 显式产物路径（相对于 `out_dir`）；`object` 目标不支持 |
+| `output` | 自动 | 显式产物路径（相对于 `out_dir`）；`object` 目标也可指定，但要求恰好一个源文件 |
 | `target` | 无 | 目标级交叉编译三元组 |
+| `toolchain` | 无 | 引用 `[toolchain.<name>]` 预设 |
+| `compiler` | 无 | 同时覆盖 `cc` 与 `linker`，并按名称推导 `cxx`（`gcc`→`g++` 等） |
+| `cc` / `cxx` / `asm` / `ar` / `linker` | 无 | 覆盖单个工具 |
+| `workdir` | 项目根 | `custom` 步骤的工作目录（相对项目根） |
+| `stdout` | 无 | 把 `custom` 步骤的标准输出重定向到该文件 |
+| `asm_format` | 按平台 | NASM 输出格式，如 `elf64`、`win64`、`macho64`、`bin` |
 | `env` | `{}` | 执行该目标步骤时附加的环境变量 |
 | `test` | `false` | 标记为测试可执行文件，供 `wbuild test` 运行 |
 
@@ -156,7 +182,7 @@ Rust 专用：`edition`（默认 `"2021"`）、`crate_type`（`bin`、`staticlib
 
 Cargo 专用：`manifest`（必需，`Cargo.toml` 路径）、`features`、`cargo_args`。
 
-Custom 专用：`program`（必需，名称或路径）、`args`、`inputs`（参与指纹的输入文件/glob）、`outputs`（必需，首个为主产物）。所有参数直接传给程序，不经过 shell。
+Custom 专用：`program`（必需，名称或路径，也可以指向其他目标的声明产物）、`args`、`inputs`（参与指纹的输入文件/glob）、`outputs`（首个为主产物；可用 `stdout` 代替）、`workdir`、`stdout`。所有参数直接传给程序，不经过 shell。`program` 指向尚未生成的声明产物时，规划阶段会放行；请通过 `links` 保证它先被构建。
 
 ## 示例
 
@@ -247,7 +273,35 @@ sources = ["src/main.c"]
 links = ["piece"]
 ```
 
-`object` 目标只编译不链接；对象文件写入 `build/<profile>/obj/<target>/`，并会被下游可执行文件或静态库自动加入链接输入。
+`object` 目标只编译不链接；对象文件写入 `build/<profile>/obj/<target>/`，并会被下游可执行文件或静态库自动加入链接输入。指定 `output` 时，编译结果直接写入该路径（要求恰好一个源文件），例如把 NASM 汇编成裸二进制：
+
+```toml
+[target.smp_tramp]
+kind = "object"
+sources = ["arch/x86_64/boot/smp_trampoline.nasm"]
+asm_format = "bin"
+output = "smp_trampoline.bin"
+```
+
+非链接产物（如 `.bin`）不会被自动加入链接输入；需要 `.o` 时可用一个 `objcopy` 的 `custom` 目标引用它。
+
+### 具名产物与多产物目标
+
+每个 `outputs` 条目都会注册为 `<target>:<路径>` 和 `<target>:<文件名>` 两种具名产物，可直接写进 `links`：
+
+```toml
+[target.userland]
+kind = "custom"
+program = "build-userland"
+outputs = ["out/init.elf", "out/init_elf.o"]
+
+[target.kernel]
+kind = "exe"
+sources = ["src/*.c"]
+links = ["userland:out/init_elf.o"]
+```
+
+具名产物只有扩展名为 `.o`/`.obj`/`.a`/`.lib`/`.so`/`.dylib`/`.dll`/`.rlib` 时才会自动进入链接输入；`.elf`、`.bin` 等仍需通过 `ldflags` 或 `objcopy` 显式处理。
 
 ### 自定义目标
 
@@ -265,7 +319,20 @@ include = ["gen"]
 links = ["gen"]
 ```
 
-`program` 可以是 `PATH` 中的名称，也可以是相对于项目根的路径。`inputs`（以及 `sources`）参与指纹，任一输入变化都会重新运行；`outputs` 的首项作为主产物，其余作为附加产物一起检查。其他目标通过 `links` 依赖 `gen` 后，可以直接把 `gen` 声明的输出写进自己的 `sources`/`include`——即使这些文件在首次规划时还不存在，WBuild 也会先完成生成步骤再编译消费者。
+`program` 可以是 `PATH` 中的名称、相对于项目根的路径，或其他目标声明的产物。`inputs`（以及 `sources`）参与指纹，任一输入变化都会重新运行；`outputs` 的首项作为主产物，其余作为附加产物一起检查并缓存。其他目标通过 `links` 依赖 `gen` 后，可以直接把 `gen` 声明的输出写进自己的 `sources`/`include`——即使这些文件在首次规划时还不存在，WBuild 也会先完成生成步骤再编译消费者。
+
+需要把命令的标准输出保存成文件时，用 `stdout` 代替 `outputs`（也可以同时使用，`stdout` 会成为附加产物）：
+
+```toml
+[target.system_map]
+kind = "custom"
+program = "nm"
+args = ["-n", "out/kernel"]
+stdout = "out/System.map"
+links = ["kernel"]
+```
+
+`workdir` 可以改变 `custom` 步骤的工作目录，适合 `objcopy` 这类必须在输入文件所在目录执行的工具。`wbuild run <custom>` 只构建它的 `links`，然后直接运行 `program + args`，不会把 `custom` 步骤本身再执行一次。
 
 ### 测试目标
 
@@ -304,8 +371,8 @@ sysroot = "/opt/sysroot/aarch64"
 
 每个步骤的指纹由以下内容组成：
 
-1. 工具链身份（编译器路径、版本、目标三元组、sysroot）；
-2. 步骤种类、程序路径、完整参数、环境变量与输出路径；
+1. 工具链身份（编译器路径、版本、目标三元组、sysroot）；使用 `toolchain`/`compiler` 覆盖的目标使用自己的工具链指纹；
+2. 步骤种类、程序路径、完整参数、环境变量、工作目录与输出路径；
 3. 所有静态输入文件的内容哈希（源文件等）；
 4. 上一次构建发现的所有头文件/依赖文件路径及其**内容哈希**。
 
@@ -314,8 +381,8 @@ sysroot = "/opt/sysroot/aarch64"
 缓存采用两级结构：
 
 - **命令指纹**（不含依赖）索引多个构建变体；
-- 每个变体记录依赖集合的哈希与产物指纹；
-- 查找时先用当前依赖内容验证哈希，再原子地恢复产物。
+- 每个变体记录依赖集合的哈希、主产物指纹以及所有附加产物指纹；
+- 查找时先用当前依赖内容验证哈希，再原子地恢复主产物和全部附加产物；任一附加产物缺失都视为未命中。
 
 因此：
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use walkdir::WalkDir;
 
-use crate::config::{Kind, LoadedConfig, OptLevel, ResolvedProfile, Target};
+use crate::config::{Compiler, Kind, LoadedConfig, OptLevel, ResolvedProfile, Target};
 use crate::graph::Dag;
 use crate::toolchain::{object_extension, triple_os, Family, Tool, Toolchain};
 use crate::util;
@@ -66,6 +66,10 @@ pub struct Step {
     pub inputs: Vec<PathBuf>,
     pub output: PathBuf,
     pub extra_outputs: Vec<PathBuf>,
+    /// Redirect stdout to this file instead of capturing it.
+    pub stdout: Option<PathBuf>,
+    /// Toolchain fingerprint override for per-target toolchains.
+    pub toolchain_fp: Option<String>,
     pub depfile: Option<PathBuf>,
     pub dep_source: DepSource,
     pub cacheable: bool,
@@ -120,6 +124,8 @@ pub struct Plan {
     pub steps: Vec<Step>,
     pub dag: Dag,
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Named outputs addressable as `target:name`.
+    pub named: BTreeMap<String, Artifact>,
     /// Targets in dependency order.
     pub order: Vec<String>,
     pub profile_dir: PathBuf,
@@ -137,6 +143,8 @@ pub struct Planner<'a> {
     tc: &'a Toolchain,
     steps: Vec<Step>,
     artifacts: BTreeMap<String, Artifact>,
+    named: BTreeMap<String, Artifact>,
+    overrides: BTreeMap<String, Toolchain>,
     profile_dir: PathBuf,
 }
 
@@ -153,11 +161,14 @@ impl<'a> Planner<'a> {
             tc,
             steps: Vec::new(),
             artifacts: BTreeMap::new(),
+            named: BTreeMap::new(),
+            overrides: BTreeMap::new(),
             profile_dir: loaded.out_dir.join(&profile.name),
         };
 
         let order = planner.target_order()?;
         let needed = planner.needed_targets(&order, selection)?;
+        planner.detect_overrides(&needed)?;
 
         for name in &order {
             if !needed.contains(name) {
@@ -180,6 +191,7 @@ impl<'a> Planner<'a> {
             steps: planner.steps,
             dag,
             artifacts: planner.artifacts,
+            named: planner.named,
             order: order.into_iter().filter(|n| needed.contains(n)).collect(),
             profile_dir: planner.profile_dir,
         })
@@ -187,6 +199,31 @@ impl<'a> Planner<'a> {
 
     fn dep_lists(&self) -> Vec<Vec<usize>> {
         self.steps.iter().map(|s| s.deps.clone()).collect()
+    }
+
+    /// Detect a separate toolchain for every selected target that overrides
+    /// compiler settings. Targets without overrides keep using the global one.
+    fn detect_overrides(&mut self, needed: &BTreeSet<String>) -> Result<()> {
+        let state_dir = self.loaded.state_dir();
+        for name in needed {
+            let target = &self.loaded.config.target[name];
+            if !target.has_tool_overrides() {
+                continue;
+            }
+            let compiler = compiler_for(self.loaded, target)?;
+            let toolchain = Toolchain::detect_cached(&compiler, &self.loaded.root, &state_dir)
+                .with_context(|| format!("target `{name}`: cannot detect toolchain"))?;
+            self.overrides.insert(name.clone(), toolchain);
+        }
+        Ok(())
+    }
+
+    fn toolchain_for(&self, name: &str) -> &Toolchain {
+        self.overrides.get(name).unwrap_or(self.tc)
+    }
+
+    fn toolchain_fp(&self, name: &str) -> Option<String> {
+        self.overrides.get(name).map(|tc| tc.fingerprint.clone())
     }
 
     fn target_order(&self) -> Result<Vec<String>> {
@@ -202,7 +239,8 @@ impl<'a> Planner<'a> {
             let target = &self.loaded.config.target[name];
             let mut list = Vec::new();
             for link in &target.links {
-                match index.get(link.as_str()) {
+                let base = link_target(link);
+                match index.get(base) {
                     Some(&i) => list.push(i),
                     None => bail!(
                         "target `{name}` links to unknown target `{link}` \
@@ -227,7 +265,8 @@ impl<'a> Planner<'a> {
         }
         let mut needed = BTreeSet::new();
         for name in selection {
-            if !self.loaded.config.target.contains_key(name) {
+            let base = link_target(name);
+            if !self.loaded.config.target.contains_key(base) {
                 bail!(
                     "unknown target `{name}` (available: {})",
                     self.loaded
@@ -239,7 +278,7 @@ impl<'a> Planner<'a> {
                         .join(", ")
                 );
             }
-            self.mark_needed(name, &mut needed);
+            self.mark_needed(base, &mut needed);
         }
         Ok(needed)
     }
@@ -250,8 +289,9 @@ impl<'a> Planner<'a> {
         }
         if let Some(target) = self.loaded.config.target.get(name) {
             for link in &target.links {
-                if self.loaded.config.target.contains_key(link) {
-                    self.mark_needed(link, needed);
+                let base = link_target(link);
+                if self.loaded.config.target.contains_key(base) {
+                    self.mark_needed(base, needed);
                 }
             }
         }
@@ -321,9 +361,58 @@ impl<'a> Planner<'a> {
     }
 
     fn artifact(&self, name: &str, requester: &str) -> Result<Artifact> {
+        if let Some(artifact) = self.named.get(name) {
+            return Ok(artifact.clone());
+        }
         self.artifacts.get(name).cloned().with_context(|| {
             format!("target `{requester}` depends on `{name}` which was not planned yet")
         })
+    }
+
+    fn register_named_output(
+        &mut self,
+        target: &str,
+        output: &Path,
+        final_step: usize,
+        kind: Kind,
+        linkable: bool,
+        shared_dirs: &[PathBuf],
+    ) -> Result<()> {
+        let file_name = output
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| output.display().to_string());
+        let keys = [
+            format!("{target}:{}", util::display_path(&self.loaded.root, output)),
+            format!("{target}:{file_name}"),
+        ];
+        let artifact = Artifact {
+            output: output.to_path_buf(),
+            link_inputs: if linkable {
+                vec![output.to_path_buf()]
+            } else {
+                Vec::new()
+            },
+            shared_dirs: shared_dirs.to_vec(),
+            final_step,
+            kind,
+        };
+        for (index, key) in keys.into_iter().enumerate() {
+            if let Some(existing) = self.named.get(&key) {
+                if existing.output != output && index == 0 {
+                    bail!(
+                        "target `{target}`: output path `{}` is declared twice",
+                        output.display()
+                    );
+                }
+                // A short file name may be ambiguous (for example two
+                // same-named objects in different directories). The full path
+                // remains available, so keep the first short name.
+                continue;
+            }
+            self.named.insert(key, artifact.clone());
+        }
+        Ok(())
     }
 
     fn compile_sources_to_objects(
@@ -331,6 +420,7 @@ impl<'a> Planner<'a> {
         name: &str,
         target: &Target,
         is_shared: bool,
+        output_override: Option<&Path>,
     ) -> Result<(Vec<PathBuf>, Vec<usize>, String)> {
         let sources = expand_sources(self.loaded, name, target)?;
         if sources.is_empty() {
@@ -339,7 +429,13 @@ impl<'a> Planner<'a> {
                 target.sources
             );
         }
-        let os = self.target_os(target);
+        if output_override.is_some() && sources.len() != 1 {
+            bail!(
+                "target `{name}`: `output` requires exactly one source file, found {}",
+                sources.len()
+            );
+        }
+        let os = self.target_os_for(name, target);
         let object_dir = self.profile_dir.join("obj").join(sanitize_name(name));
         let mut objects = Vec::new();
         let mut compile_ids = Vec::new();
@@ -363,9 +459,11 @@ impl<'a> Planner<'a> {
                 .unwrap_or_else(|_| PathBuf::from(source.file_name().unwrap_or_default()));
             let ext = match lang {
                 Lang::AsmNasm => "o",
-                _ => object_extension(self.primary_family()),
+                _ => object_extension(self.primary_family_for(name)),
             };
-            let object = object_dir.join(&rel).with_extension(ext);
+            let object = output_override
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| object_dir.join(&rel).with_extension(ext));
             let depfile = self
                 .loaded
                 .state_dir()
@@ -384,7 +482,12 @@ impl<'a> Planner<'a> {
 
     /// `kind = "object"`: compile every source but stop before linking.
     fn plan_object_target(&mut self, name: &str, target: &Target) -> Result<()> {
-        let (objects, compile_ids, _os) = self.compile_sources_to_objects(name, target, false)?;
+        let output_override = target
+            .output
+            .as_ref()
+            .map(|output| util::abs_path(&self.loaded.out_dir, output));
+        let (objects, compile_ids, _os) =
+            self.compile_sources_to_objects(name, target, false, output_override.as_deref())?;
 
         let mut dep_final_steps = Vec::new();
         for dep in &target.links {
@@ -395,24 +498,38 @@ impl<'a> Planner<'a> {
             self.steps[*id].deps.extend(dep_final_steps.iter().copied());
         }
 
-        if target.output.is_some() {
-            bail!("target `{name}`: `output` is not supported for object targets");
-        }
-        let output = objects
-            .first()
+        let output = output_override.unwrap_or_else(|| {
+            objects
+                .first()
+                .cloned()
+                .expect("compile_sources_to_objects returns at least one object")
+        });
+        let link_inputs: Vec<PathBuf> = objects
+            .iter()
+            .filter(|path| is_linkable_output(path))
             .cloned()
-            .expect("compile_sources_to_objects returns at least one object");
+            .collect();
         let final_step = *compile_ids.last().expect("at least one compile step");
         self.artifacts.insert(
             name.to_string(),
             Artifact {
-                output,
-                link_inputs: objects,
+                output: output.clone(),
+                link_inputs,
                 shared_dirs: Vec::new(),
                 final_step,
                 kind: Kind::Object,
             },
         );
+        for (object, id) in objects.iter().zip(compile_ids.iter().copied()) {
+            self.register_named_output(
+                name,
+                object,
+                id,
+                Kind::Object,
+                is_linkable_output(object),
+                &[],
+            )?;
+        }
         Ok(())
     }
 
@@ -423,10 +540,8 @@ impl<'a> Planner<'a> {
             .program
             .as_deref()
             .with_context(|| format!("target `{name}`: custom target requires `program`"))?;
-        let extra_paths: Vec<PathBuf> = self
-            .loaded
-            .config
-            .compiler
+        let compiler = compiler_for(self.loaded, target)?;
+        let extra_paths: Vec<PathBuf> = compiler
             .extra_paths
             .iter()
             .map(|p| util::abs_path(&self.loaded.root, p))
@@ -434,15 +549,24 @@ impl<'a> Planner<'a> {
         let program = resolve_program(self.loaded, program_text, &extra_paths)
             .with_context(|| format!("target `{name}`: cannot resolve `program`"))?;
 
-        let outputs: Vec<PathBuf> = target
+        let stdout = target
+            .stdout
+            .as_ref()
+            .map(|p| util::abs_path(&self.loaded.root, p));
+        let mut outputs: Vec<PathBuf> = target
             .outputs
             .iter()
             .map(|p| util::abs_path(&self.loaded.root, p))
             .collect();
+        if let Some(stdout) = &stdout {
+            if !outputs.contains(stdout) {
+                outputs.push(stdout.clone());
+            }
+        }
         let output = outputs
             .first()
             .cloned()
-            .with_context(|| format!("target `{name}`: custom target requires `outputs`"))?;
+            .with_context(|| format!("target `{name}`: custom target requires an output"))?;
         let extra_outputs = outputs[1..].to_vec();
 
         let mut patterns = target.inputs.clone();
@@ -454,6 +578,12 @@ impl<'a> Planner<'a> {
             deps.push(self.artifact(dep, name)?.final_step);
         }
 
+        let workdir = target
+            .workdir
+            .as_ref()
+            .map(|dir| util::abs_path(&self.loaded.root, dir))
+            .unwrap_or_else(|| self.loaded.root.clone());
+
         let id = self.steps.len();
         let label = format!("RUN {}", self.arg(&output));
         self.steps.push(Step {
@@ -464,10 +594,12 @@ impl<'a> Planner<'a> {
             program,
             args: target.args.clone(),
             env: target.env.clone(),
-            workdir: self.loaded.root.clone(),
+            workdir,
             inputs,
             output: output.clone(),
             extra_outputs,
+            stdout,
+            toolchain_fp: self.toolchain_fp(name),
             depfile: None,
             dep_source: DepSource::None,
             cacheable: true,
@@ -478,20 +610,30 @@ impl<'a> Planner<'a> {
         self.artifacts.insert(
             name.to_string(),
             Artifact {
-                output,
+                output: output.clone(),
                 link_inputs: Vec::new(),
                 shared_dirs: Vec::new(),
                 final_step: id,
                 kind: Kind::Custom,
             },
         );
+        for path in &outputs {
+            self.register_named_output(
+                name,
+                path,
+                id,
+                Kind::Custom,
+                is_linkable_output(path),
+                &[],
+            )?;
+        }
         Ok(())
     }
 
     fn plan_cc_target(&mut self, name: &str, target: &Target) -> Result<()> {
         let is_shared = target.kind == Kind::Sharedlib;
         let (objects, compile_ids, os) =
-            self.compile_sources_to_objects(name, target, is_shared)?;
+            self.compile_sources_to_objects(name, target, is_shared, None)?;
 
         // Dependency targets.
         let mut dep_final_steps = Vec::new();
@@ -527,17 +669,34 @@ impl<'a> Planner<'a> {
         self.steps[link_id].deps = deps;
 
         let output = self.steps[link_id].output.clone();
-        let _ = extra_outputs;
         self.artifacts.insert(
             name.to_string(),
             Artifact {
-                output,
+                output: output.clone(),
                 link_inputs,
-                shared_dirs,
+                shared_dirs: shared_dirs.clone(),
                 final_step: link_id,
                 kind: target.kind,
             },
         );
+        self.register_named_output(
+            name,
+            &output,
+            link_id,
+            target.kind,
+            is_linkable_output(&output),
+            &shared_dirs,
+        )?;
+        for extra in &extra_outputs {
+            self.register_named_output(
+                name,
+                extra,
+                link_id,
+                target.kind,
+                is_linkable_output(extra),
+                &shared_dirs,
+            )?;
+        }
         Ok(())
     }
 
@@ -553,11 +712,12 @@ impl<'a> Planner<'a> {
         is_shared: bool,
         os: &str,
     ) -> Result<usize> {
+        let tc = self.toolchain_for(target_name);
         let (tool, kind) = match lang {
-            Lang::C => (self.tc.require_cc()?, StepKind::CCompile),
-            Lang::Cxx => (self.tc.require_cxx()?, StepKind::CxxCompile),
-            Lang::AsmGas => (self.tc.require_cc()?, StepKind::AsmCompile),
-            Lang::AsmNasm => (self.tc.require_asm()?, StepKind::AsmCompile),
+            Lang::C => (tc.require_cc()?.clone(), StepKind::CCompile),
+            Lang::Cxx => (tc.require_cxx()?.clone(), StepKind::CxxCompile),
+            Lang::AsmGas => (tc.require_cc()?.clone(), StepKind::AsmCompile),
+            Lang::AsmNasm => (tc.require_asm()?.clone(), StepKind::AsmCompile),
             Lang::Rust => unreachable!(),
         };
         let family = tool.family;
@@ -581,7 +741,12 @@ impl<'a> Planner<'a> {
         match lang {
             Lang::AsmNasm => {
                 args.push("-f".into());
-                args.push(nasm_format(os).into());
+                args.push(
+                    target
+                        .asm_format
+                        .clone()
+                        .unwrap_or_else(|| nasm_format(os).to_string()),
+                );
                 args.push("-o".into());
                 args.push(obj_arg.clone());
                 args.push(src_arg.clone());
@@ -674,6 +839,8 @@ impl<'a> Planner<'a> {
             inputs: vec![source.to_path_buf()],
             output: object.to_path_buf(),
             extra_outputs: Vec::new(),
+            stdout: None,
+            toolchain_fp: self.toolchain_fp(target_name),
             depfile: if dep_source == DepSource::None {
                 None
             } else {
@@ -703,7 +870,7 @@ impl<'a> Planner<'a> {
 
         match target.kind {
             Kind::Staticlib => {
-                let ar = self.tc.require_ar()?;
+                let ar = self.toolchain_for(name).require_ar()?.clone();
                 let mut args = Vec::new();
                 if ar.family.is_msvc() {
                     args.push("/nologo".into());
@@ -721,7 +888,7 @@ impl<'a> Planner<'a> {
                     target,
                     StepKind::Archive,
                     label,
-                    ar,
+                    &ar,
                     args,
                     output.clone(),
                     Vec::new(),
@@ -741,7 +908,7 @@ impl<'a> Planner<'a> {
                 ))
             }
             Kind::Exe | Kind::Sharedlib => {
-                let linker = self.tc.require_linker()?;
+                let linker = self.toolchain_for(name).require_linker()?.clone();
                 let family = linker.family;
                 let shared = target.kind == Kind::Sharedlib;
                 let mut args = Vec::new();
@@ -764,7 +931,7 @@ impl<'a> Planner<'a> {
                     if self.profile.lto {
                         args.push("/LTCG".into());
                     }
-                    for flag in self.ldflags(target) {
+                    for flag in self.ldflags(name, target) {
                         args.push(flag);
                     }
                     for dir in self.lib_dirs(target) {
@@ -790,7 +957,7 @@ impl<'a> Planner<'a> {
                     if self.profile.lto {
                         args.push("-flto".into());
                     }
-                    for flag in self.ldflags(target) {
+                    for flag in self.ldflags(name, target) {
                         args.push(flag);
                     }
                     for dir in self.lib_dirs(target) {
@@ -819,7 +986,7 @@ impl<'a> Planner<'a> {
                     target,
                     StepKind::Link,
                     label,
-                    linker,
+                    &linker,
                     args,
                     output.clone(),
                     extra_outputs.clone(),
@@ -887,6 +1054,8 @@ impl<'a> Planner<'a> {
             inputs: inputs.to_vec(),
             output,
             extra_outputs,
+            stdout: None,
+            toolchain_fp: self.toolchain_fp(target_name),
             depfile,
             dep_source,
             cacheable,
@@ -898,7 +1067,7 @@ impl<'a> Planner<'a> {
     }
 
     fn plan_rust(&mut self, name: &str, target: &Target) -> Result<usize> {
-        let rustc = self.tc.require_rustc()?;
+        let rustc = self.toolchain_for(name).require_rustc()?.clone();
         let sources = expand_sources(self.loaded, name, target)?;
         if sources.len() != 1 {
             bail!(
@@ -912,13 +1081,13 @@ impl<'a> Planner<'a> {
             .crate_type
             .clone()
             .unwrap_or_else(|| "bin".to_string());
-        let os = self.target_os(target);
+        let os = self.target_os_for(name, target);
         let output = match &target.output {
             Some(o) => util::abs_path(&self.loaded.out_dir, o),
             None => {
                 let dir = self.profile_dir.clone();
                 match crate_type.as_str() {
-                    "staticlib" => dir.join(if self.primary_family().is_msvc() {
+                    "staticlib" => dir.join(if self.primary_family_for(name).is_msvc() {
                         format!("{name}.lib")
                     } else {
                         format!("lib{name}.a")
@@ -962,7 +1131,11 @@ impl<'a> Planner<'a> {
         if self.profile.lto {
             args.push("-Clto=thin".into());
         }
-        if let Some(triple) = target.target.as_ref().or(self.tc.target.as_ref()) {
+        let triple = target
+            .target
+            .clone()
+            .or_else(|| self.toolchain_for(name).target.clone());
+        if let Some(triple) = &triple {
             args.push("--target".into());
             args.push(triple.clone());
         }
@@ -978,7 +1151,7 @@ impl<'a> Planner<'a> {
                     .map(|e| e == "rlib" || e == "so" || e == "dylib" || e == "dll")
                     .unwrap_or(false)
                 {
-                    let dep_name = dep.replace(['-', '.'], "_");
+                    let dep_name = link_target(dep).replace(['-', '.'], "_");
                     args.push("--extern".into());
                     args.push(format!("{dep_name}={}", self.arg(input)));
                 }
@@ -1012,8 +1185,10 @@ impl<'a> Planner<'a> {
             env: target.env.clone(),
             workdir: self.loaded.root.clone(),
             inputs: vec![crate_root.clone()],
-            output,
+            output: output.clone(),
             extra_outputs: Vec::new(),
+            stdout: None,
+            toolchain_fp: self.toolchain_fp(name),
             depfile: Some(depfile),
             dep_source: DepSource::Makefile,
             cacheable: true,
@@ -1022,6 +1197,14 @@ impl<'a> Planner<'a> {
             copy_from: None,
         });
         self.steps[id].deps = dep_steps;
+        self.register_named_output(
+            name,
+            &output,
+            id,
+            Kind::Rust,
+            is_linkable_output(&output),
+            &[],
+        )?;
         Ok(id)
     }
 
@@ -1037,10 +1220,8 @@ impl<'a> Planner<'a> {
                 manifest.display()
             );
         }
-        let extra_paths: Vec<PathBuf> = self
-            .loaded
-            .config
-            .compiler
+        let compiler = compiler_for(self.loaded, target)?;
+        let extra_paths: Vec<PathBuf> = compiler
             .extra_paths
             .iter()
             .map(|p| util::abs_path(&self.loaded.root, p))
@@ -1054,7 +1235,7 @@ impl<'a> Planner<'a> {
         let artifact = cargo_artifact(&cargo, &manifest, name, target, release, self)?;
         let output = match &target.output {
             Some(o) => util::abs_path(&self.loaded.out_dir, o),
-            None => self.default_cargo_output(name, release, &self.target_os(target)),
+            None => self.default_cargo_output(name, release, &self.target_os_for(name, target)),
         };
 
         let mut args: Vec<String> = vec![
@@ -1065,7 +1246,11 @@ impl<'a> Planner<'a> {
         if release {
             args.push("--release".into());
         }
-        if let Some(triple) = target.target.as_ref().or(self.tc.target.as_ref()) {
+        let triple = target
+            .target
+            .clone()
+            .or_else(|| self.toolchain_for(name).target.clone());
+        if let Some(triple) = &triple {
             args.push("--target".into());
             args.push(triple.clone());
         }
@@ -1089,6 +1274,8 @@ impl<'a> Planner<'a> {
             inputs,
             output: artifact.clone(),
             extra_outputs: Vec::new(),
+            stdout: None,
+            toolchain_fp: self.toolchain_fp(name),
             depfile: None,
             dep_source: DepSource::None,
             cacheable: false,
@@ -1099,6 +1286,14 @@ impl<'a> Planner<'a> {
 
         // Ensure the stable output location.
         if output == artifact {
+            self.register_named_output(
+                name,
+                &output,
+                build_id,
+                Kind::Cargo,
+                is_linkable_output(&output),
+                &[],
+            )?;
             return Ok((build_id, build_id, output));
         }
         let copy_id = self.steps.len();
@@ -1114,6 +1309,8 @@ impl<'a> Planner<'a> {
             inputs: vec![artifact.clone()],
             output: output.clone(),
             extra_outputs: Vec::new(),
+            stdout: None,
+            toolchain_fp: self.toolchain_fp(name),
             depfile: None,
             dep_source: DepSource::None,
             cacheable: true,
@@ -1122,6 +1319,14 @@ impl<'a> Planner<'a> {
             copy_from: Some(artifact.clone()),
         });
         self.steps[copy_id].deps = vec![build_id];
+        self.register_named_output(
+            name,
+            &output,
+            copy_id,
+            Kind::Cargo,
+            is_linkable_output(&output),
+            &[],
+        )?;
         let _ = cargo_version;
         Ok((build_id, copy_id, output))
     }
@@ -1139,7 +1344,7 @@ impl<'a> Planner<'a> {
             return util::abs_path(&self.loaded.out_dir, output);
         }
         let dir = self.profile_dir.clone();
-        let msvc = self.primary_family().is_msvc();
+        let msvc = self.primary_family_for(name).is_msvc();
         match target.kind {
             Kind::Exe => dir.join(format!("{name}{}", exe_suffix(os))),
             Kind::Staticlib => dir.join(if msvc {
@@ -1158,23 +1363,24 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn primary_family(&self) -> Family {
-        self.tc
-            .cc
+    fn primary_family_for(&self, name: &str) -> Family {
+        let tc = self.toolchain_for(name);
+        tc.cc
             .as_ref()
-            .or(self.tc.cxx.as_ref())
-            .or(self.tc.linker.as_ref())
+            .or(tc.cxx.as_ref())
+            .or(tc.linker.as_ref())
             .map(|t| t.family)
             .unwrap_or(Family::Gcc)
     }
 
-    fn target_os(&self, target: &Target) -> String {
+    fn target_os_for(&self, name: &str, target: &Target) -> String {
+        let tc = self.toolchain_for(name);
         target
             .target
             .as_deref()
-            .or(self.tc.target.as_deref())
+            .or(tc.target.as_deref())
             .and_then(triple_os)
-            .unwrap_or(self.tc.host_os)
+            .unwrap_or(tc.host_os)
             .to_string()
     }
 
@@ -1199,7 +1405,11 @@ impl<'a> Planner<'a> {
 
         // Include directories of linked targets are propagated so that a
         // consumer can `#include` its dependency's public headers.
-        let mut stack: Vec<String> = target.links.clone();
+        let mut stack: Vec<String> = target
+            .links
+            .iter()
+            .map(|link| link_target(link).to_string())
+            .collect();
         let mut visited: HashSet<String> = HashSet::new();
         while let Some(dep_name) = stack.pop() {
             if !visited.insert(dep_name.clone()) {
@@ -1209,7 +1419,7 @@ impl<'a> Planner<'a> {
                 for dir in &dep.include {
                     add(&mut dirs, dir);
                 }
-                stack.extend(dep.links.iter().cloned());
+                stack.extend(dep.links.iter().map(|link| link_target(link).to_string()));
             }
         }
         dirs
@@ -1268,14 +1478,14 @@ impl<'a> Planner<'a> {
         out
     }
 
-    fn ldflags(&self, target: &Target) -> Vec<String> {
+    fn ldflags(&self, name: &str, target: &Target) -> Vec<String> {
         let mut out = Vec::new();
         out.extend(self.loaded.config.compiler.ldflags.iter().cloned());
         out.extend(self.profile.ldflags.iter().cloned());
         out.extend(target.ldflags.iter().cloned());
-        if let Some(sysroot) = &self.tc.sysroot {
-            let family = self.primary_family();
-            if !family.is_msvc() {
+        let tc = self.toolchain_for(name);
+        if let Some(sysroot) = &tc.sysroot {
+            if !self.primary_family_for(name).is_msvc() {
                 out.push(format!("--sysroot={}", self.arg(sysroot)));
             }
         }
@@ -1397,6 +1607,113 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// `target` or `target:named-output` -> `target`.
+pub fn link_target(link: &str) -> &str {
+    link.split_once(':')
+        .map(|(target, _)| target)
+        .unwrap_or(link)
+}
+
+fn is_linkable_output(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.ends_with(".dll.a") {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref(),
+        Some("o" | "obj" | "a" | "lib" | "so" | "dylib" | "dll" | "rlib")
+    )
+}
+
+/// Clone the global compiler settings and apply the target's toolchain preset
+/// and explicit overrides.
+pub(crate) fn compiler_for(loaded: &LoadedConfig, target: &Target) -> Result<Compiler> {
+    let mut compiler = loaded.config.compiler.clone();
+    if let Some(name) = &target.toolchain {
+        let preset = loaded
+            .config
+            .toolchain
+            .get(name)
+            .with_context(|| format!("unknown toolchain preset `{name}`"))?;
+        preset.apply_to(&mut compiler);
+        if let Some(value) = &preset.compiler {
+            if preset.cxx.is_none() {
+                compiler.cxx = derive_cxx(value);
+            }
+        }
+    }
+    if let Some(value) = &target.compiler {
+        compiler.cc = value.clone();
+        compiler.linker = value.clone();
+        if target.cxx.is_none() {
+            compiler.cxx = derive_cxx(value);
+        }
+    }
+    if let Some(value) = &target.cc {
+        compiler.cc = value.clone();
+    }
+    if let Some(value) = &target.cxx {
+        compiler.cxx = value.clone();
+    }
+    if let Some(value) = &target.asm {
+        compiler.asm = value.clone();
+    }
+    if let Some(value) = &target.ar {
+        compiler.ar = value.clone();
+    }
+    if let Some(value) = &target.linker {
+        compiler.linker = value.clone();
+    }
+    Ok(compiler)
+}
+
+fn derive_cxx(cc: &str) -> String {
+    if let Some(prefix) = cc.strip_suffix("gcc") {
+        format!("{prefix}g++")
+    } else if cc.ends_with("clang") {
+        format!("{cc}++")
+    } else if let Some(prefix) = cc.strip_suffix("cc") {
+        format!("{prefix}c++")
+    } else {
+        cc.to_string()
+    }
+}
+
+fn declared_outputs_for(loaded: &LoadedConfig, target: &Target) -> Vec<PathBuf> {
+    if target.kind == Kind::Custom {
+        let mut outputs: Vec<PathBuf> = target
+            .outputs
+            .iter()
+            .map(|p| util::abs_path(&loaded.root, p))
+            .collect();
+        if let Some(stdout) = &target.stdout {
+            outputs.push(util::abs_path(&loaded.root, stdout));
+        }
+        outputs
+    } else {
+        target
+            .output
+            .as_ref()
+            .map(|output| vec![util::abs_path(&loaded.out_dir, output)])
+            .unwrap_or_default()
+    }
+}
+
+fn declared_output_paths(loaded: &LoadedConfig) -> HashSet<PathBuf> {
+    let mut paths = HashSet::new();
+    for target in loaded.config.target.values() {
+        for path in declared_outputs_for(loaded, target) {
+            paths.insert(util::normalize(&path));
+        }
+    }
+    paths
+}
+
 fn expand_sources(
     loaded: &LoadedConfig,
     target_name: &str,
@@ -1421,13 +1738,12 @@ fn is_declared_output(loaded: &LoadedConfig, consumer: &str, path: &Path) -> boo
     let Some(target) = loaded.config.target.get(consumer) else {
         return false;
     };
-    target.links.iter().any(|dep_name| {
+    target.links.iter().any(|link| {
+        let dep_name = link_target(link);
         loaded.config.target.get(dep_name).is_some_and(|dep| {
-            dep.kind == Kind::Custom
-                && dep
-                    .outputs
-                    .iter()
-                    .any(|out| util::normalize(&util::abs_path(&loaded.root, out)) == path)
+            declared_outputs_for(loaded, dep)
+                .iter()
+                .any(|out| util::normalize(out) == path)
         })
     })
 }
@@ -1526,8 +1842,9 @@ fn expand_paths(
 }
 
 /// Resolve a custom target's `program`. Paths are resolved relative to the
-/// project root; bare names are looked up on `PATH`.
-fn resolve_program(
+/// project root; bare names are looked up on `PATH`. A program may also point
+/// at another target's declared output, even before that file exists.
+pub(crate) fn resolve_program(
     loaded: &LoadedConfig,
     program: &str,
     extra_paths: &[PathBuf],
@@ -1536,12 +1853,13 @@ fn resolve_program(
         program.contains('/') || program.contains('\\') || program.starts_with('.');
     if looks_like_path {
         let path = util::abs_path(&loaded.root, program);
-        if path.is_file() {
+        let declared = declared_output_paths(loaded);
+        if path.is_file() || declared.contains(&util::normalize(&path)) {
             return Ok(path);
         }
         if cfg!(windows) && path.extension().is_none() {
             let exe = path.with_extension("exe");
-            if exe.is_file() {
+            if exe.is_file() || declared.contains(&util::normalize(&exe)) {
                 return Ok(exe);
             }
         }
@@ -1676,14 +1994,11 @@ fn cargo_artifact(
     }
 
     let profile_dir = if release { "release" } else { "debug" };
-    let os = target
-        .target
-        .as_deref()
-        .or(planner.tc.target.as_deref())
-        .and_then(triple_os)
-        .unwrap_or(planner.tc.host_os);
+    let tc = planner.toolchain_for(name);
+    let triple = target.target.clone().or_else(|| tc.target.clone());
+    let os = triple.as_deref().and_then(triple_os).unwrap_or(tc.host_os);
     let mut path = meta_dir;
-    if let Some(triple) = target.target.as_ref().or(planner.tc.target.as_ref()) {
+    if let Some(triple) = &triple {
         path = path.join(triple);
     }
     path = path.join(profile_dir);

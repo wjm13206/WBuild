@@ -19,6 +19,9 @@ pub struct CacheEntry {
     pub hash: String,
     pub deps: Vec<String>,
     pub entry: String,
+    /// Fingerprints of the extra outputs, in step order.
+    #[serde(default)]
+    pub extras: Vec<String>,
 }
 
 /// Sidecar metadata used to detect corrupted cache objects.
@@ -236,6 +239,7 @@ mod tests {
             hash: "h1".into(),
             deps: vec!["a.h".into()],
             entry: "aaaa1111".into(),
+            extras: Vec::new(),
         };
         cache.upsert("command", first.clone()).unwrap();
         assert_eq!(cache.index("command").len(), 1);
@@ -243,6 +247,7 @@ mod tests {
             hash: "h2".into(),
             deps: vec!["a.h".into(), "b.h".into()],
             entry: "bbbb2222".into(),
+            extras: Vec::new(),
         };
         cache.upsert("command", second).unwrap();
         assert_eq!(cache.index("command").len(), 2);

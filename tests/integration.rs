@@ -383,6 +383,86 @@ links = ["gen"]
 }
 
 #[test]
+fn custom_stdout_workdir_and_multi_output_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (program, echo, pwd, multi) = if cfg!(windows) {
+        (
+            "cmd",
+            r#"["/C", "echo hello"]"#,
+            r#"["/C", "cd"]"#,
+            r#"["/C", "echo a>multi/a.txt & echo b>multi/b.txt"]"#,
+        )
+    } else {
+        (
+            "sh",
+            r#"["-c", "echo hello"]"#,
+            r#"["-c", "pwd"]"#,
+            r#"["-c", "echo a > multi/a.txt; echo b > multi/b.txt"]"#,
+        )
+    };
+    write(
+        &dir.path().join("wbuild.toml"),
+        &format!(
+            r#"[project]
+name = "custom-e2e"
+
+[target.stdout]
+kind = "custom"
+program = "{program}"
+args = {echo}
+stdout = "out/stdout.txt"
+
+[target.workdir]
+kind = "custom"
+program = "{program}"
+args = {pwd}
+workdir = "work"
+stdout = "out/workdir.txt"
+
+[target.multi]
+kind = "custom"
+program = "{program}"
+args = {multi}
+outputs = ["multi/a.txt", "multi/b.txt"]
+"#
+        ),
+    );
+
+    let first = run(dir.path(), &["build"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let redirected = fs::read_to_string(dir.path().join("out/stdout.txt")).unwrap();
+    assert!(
+        redirected.contains("hello"),
+        "stdout was not redirected: {redirected}"
+    );
+    let workdir = fs::read_to_string(dir.path().join("out/workdir.txt")).unwrap();
+    assert!(
+        workdir.contains("work"),
+        "workdir was not applied: {workdir}"
+    );
+    assert!(dir.path().join("multi/a.txt").is_file());
+    assert!(dir.path().join("multi/b.txt").is_file());
+
+    // Removing every output must restore all of them from the cache bundle.
+    fs::remove_file(dir.path().join("multi/a.txt")).unwrap();
+    fs::remove_file(dir.path().join("multi/b.txt")).unwrap();
+    let second = run(dir.path(), &["build"]);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(
+        stdout(&second).contains("cached"),
+        "multi-output cache was not used:\n{}",
+        stdout(&second)
+    );
+    assert!(dir.path().join("multi/a.txt").is_file());
+    assert!(dir.path().join("multi/b.txt").is_file());
+
+    // `wbuild run` executes a custom target's program instead of its step.
+    let executed = run(dir.path(), &["run", "stdout"]);
+    assert!(executed.status.success(), "{}", stderr(&executed));
+    assert!(stdout(&executed).contains("hello"));
+}
+
+#[test]
 fn unknown_target_is_reported() {
     let dir = c_project();
     let out = run(dir.path(), &["build", "no-such-target"]);

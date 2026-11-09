@@ -26,6 +26,9 @@ pub struct Config {
     pub compiler: Compiler,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Named toolchain presets, declared as `[toolchain.<name>]`.
+    #[serde(default)]
+    pub toolchain: BTreeMap<String, ToolchainPreset>,
     /// Build targets, declared as `[target.<name>]`.
     #[serde(default)]
     pub target: BTreeMap<String, Target>,
@@ -138,6 +141,61 @@ impl Default for Compiler {
             rustflags: Vec::new(),
             ldflags: Vec::new(),
         }
+    }
+}
+
+/// A named set of compiler overrides that a target can select with
+/// `toolchain = "<name>"`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainPreset {
+    /// Shorthand for setting both `cc` and `linker` (and deriving `cxx`).
+    pub compiler: Option<String>,
+    pub cc: Option<String>,
+    pub cxx: Option<String>,
+    pub rustc: Option<String>,
+    pub asm: Option<String>,
+    pub ar: Option<String>,
+    pub linker: Option<String>,
+    pub target: Option<String>,
+    pub sysroot: Option<String>,
+    #[serde(default)]
+    pub extra_paths: Vec<String>,
+}
+
+impl ToolchainPreset {
+    pub fn apply_to(&self, compiler: &mut Compiler) {
+        if let Some(value) = &self.compiler {
+            compiler.cc = value.clone();
+            compiler.linker = value.clone();
+        }
+        if let Some(value) = &self.cc {
+            compiler.cc = value.clone();
+        }
+        if let Some(value) = &self.cxx {
+            compiler.cxx = value.clone();
+        }
+        if let Some(value) = &self.rustc {
+            compiler.rustc = value.clone();
+        }
+        if let Some(value) = &self.asm {
+            compiler.asm = value.clone();
+        }
+        if let Some(value) = &self.ar {
+            compiler.ar = value.clone();
+        }
+        if let Some(value) = &self.linker {
+            compiler.linker = value.clone();
+        }
+        if let Some(value) = &self.target {
+            compiler.target = Some(value.clone());
+        }
+        if let Some(value) = &self.sysroot {
+            compiler.sysroot = Some(value.clone());
+        }
+        compiler
+            .extra_paths
+            .extend(self.extra_paths.iter().cloned());
     }
 }
 
@@ -297,6 +355,11 @@ impl Config {
                 bail!("target names must not be empty");
             }
             target.validate(name)?;
+            if let Some(preset) = &target.toolchain {
+                if !self.toolchain.contains_key(preset) {
+                    bail!("target `{name}`: unknown toolchain preset `{preset}`");
+                }
+            }
         }
         // Profile references must resolve.
         for profile in self.profiles.keys() {
@@ -466,6 +529,21 @@ pub struct Target {
     pub output: Option<String>,
     /// Per-target target triple override (cross compilation).
     pub target: Option<String>,
+    /// Named toolchain preset (see `[toolchain.<name>]`).
+    pub toolchain: Option<String>,
+    /// Shorthand for overriding both `cc` and `linker` (and deriving `cxx`).
+    pub compiler: Option<String>,
+    pub cc: Option<String>,
+    pub cxx: Option<String>,
+    pub asm: Option<String>,
+    pub ar: Option<String>,
+    pub linker: Option<String>,
+    /// Working directory for custom steps. Defaults to the project root.
+    pub workdir: Option<String>,
+    /// Redirect a custom step's standard output to this file.
+    pub stdout: Option<String>,
+    /// NASM output format (`elf64`, `win64`, `macho64`, `bin`, ...).
+    pub asm_format: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     // Rust specific.
@@ -511,6 +589,16 @@ impl Default for Target {
             cxx_std: None,
             output: None,
             target: None,
+            toolchain: None,
+            compiler: None,
+            cc: None,
+            cxx: None,
+            asm: None,
+            ar: None,
+            linker: None,
+            workdir: None,
+            stdout: None,
+            asm_format: None,
             env: BTreeMap::new(),
             edition: None,
             crate_type: None,
@@ -544,8 +632,15 @@ impl Target {
                 {
                     bail!("target `{name}`: kind \"custom\" requires `program`");
                 }
-                if self.outputs.is_empty() {
-                    bail!("target `{name}`: kind \"custom\" requires at least one output");
+                if self.outputs.is_empty() && self.stdout.is_none() {
+                    bail!(
+                        "target `{name}`: kind \"custom\" requires at least one output or `stdout`"
+                    );
+                }
+            }
+            Kind::Object => {
+                if self.sources.is_empty() {
+                    bail!("target `{name}`: `sources` must not be empty");
                 }
             }
             Kind::Cargo => {
@@ -567,6 +662,17 @@ impl Target {
             }
         }
         Ok(())
+    }
+
+    /// True when this target asks for a toolchain different from the global one.
+    pub fn has_tool_overrides(&self) -> bool {
+        self.toolchain.is_some()
+            || self.compiler.is_some()
+            || self.cc.is_some()
+            || self.cxx.is_some()
+            || self.asm.is_some()
+            || self.ar.is_some()
+            || self.linker.is_some()
     }
 }
 
@@ -761,6 +867,43 @@ test = true
         assert_eq!(custom.program.as_deref(), Some("tool"));
         assert_eq!(custom.outputs.len(), 2);
         assert!(cfg.target["suite"].test);
+    }
+
+    #[test]
+    fn parses_toolchain_presets_and_target_overrides() {
+        let cfg: Config = toml::from_str(
+            r#"
+[project]
+name = "demo"
+
+[toolchain.musl]
+compiler = "musl-gcc"
+target = "x86_64-linux-musl"
+
+[target.app]
+sources = ["src/main.c"]
+toolchain = "musl"
+workdir = "sub"
+stdout = "out/log.txt"
+asm_format = "bin"
+
+[target.asm]
+kind = "object"
+sources = ["boot/start.nasm"]
+output = "start.bin"
+asm_format = "bin"
+"#,
+        )
+        .unwrap();
+        let app = &cfg.target["app"];
+        assert_eq!(app.toolchain.as_deref(), Some("musl"));
+        assert_eq!(app.workdir.as_deref(), Some("sub"));
+        assert_eq!(app.stdout.as_deref(), Some("out/log.txt"));
+        assert_eq!(app.asm_format.as_deref(), Some("bin"));
+        let preset = &cfg.toolchain["musl"];
+        assert_eq!(preset.compiler.as_deref(), Some("musl-gcc"));
+        assert_eq!(preset.target.as_deref(), Some("x86_64-linux-musl"));
+        assert_eq!(cfg.target["asm"].output.as_deref(), Some("start.bin"));
     }
 
     #[test]
