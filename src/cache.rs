@@ -11,14 +11,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// One cached variant of a step. `entry` is the content fingerprint under
-/// which the artifact is stored; `hash` identifies the set and contents of the
-/// discovered dependencies at the time the artifact was produced.
+/// One cached variant of a step. `entry` is the fingerprint under which the
+/// artifact is stored; `hash` identifies the set and contents of the discovered
+/// dependencies at the time the artifact was produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
     pub hash: String,
     pub deps: Vec<String>,
     pub entry: String,
+}
+
+/// Sidecar metadata used to detect corrupted cache objects.
+#[derive(Debug, Serialize, Deserialize)]
+struct ObjectMeta {
+    /// BLAKE3 of the stored bytes.
+    hash: String,
+    /// Stored length, checked before hashing to fail fast on truncation.
+    len: u64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -60,30 +69,72 @@ impl Cache {
             .join(format!("{fingerprint}.json"))
     }
 
-    /// Look up a cached artifact. Returns `None` when caching is disabled.
+    fn meta_entry(&self, fingerprint: &str, ext: &str) -> PathBuf {
+        let shard = fingerprint.get(0..2).unwrap_or("00");
+        self.root
+            .join("objects")
+            .join(shard)
+            .join(format!("{fingerprint}.{ext}.meta"))
+    }
+
+    fn read_meta(&self, fingerprint: &str, ext: &str) -> Option<ObjectMeta> {
+        let text = fs::read_to_string(self.meta_entry(fingerprint, ext)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Remove an object whose bytes no longer match its metadata.
+    fn discard(&self, fingerprint: &str, ext: &str) {
+        let _ = fs::remove_file(self.entry(fingerprint, ext));
+        let _ = fs::remove_file(self.meta_entry(fingerprint, ext));
+    }
+
+    /// Look up a cached artifact. Returns `None` when caching is disabled, when
+    /// the object is missing, or when its contents fail verification.
     pub fn artifact(&self, fingerprint: &str, ext: &str) -> Option<PathBuf> {
         if !self.enabled {
             return None;
         }
         let path = self.entry(fingerprint, ext);
-        if path.is_file() {
-            Some(path)
-        } else {
-            None
+        if !path.is_file() {
+            return None;
+        }
+        let Some(meta) = self.read_meta(fingerprint, ext) else {
+            // Objects written by older versions have no metadata; treat them as
+            // a miss so the next build re-creates them with a checksum.
+            return None;
+        };
+        let len = fs::metadata(&path).ok()?.len();
+        if len != meta.len {
+            self.discard(fingerprint, ext);
+            return None;
+        }
+        match crate::hash::hash_file(&path) {
+            Ok(hash) if hash == meta.hash => Some(path),
+            _ => {
+                self.discard(fingerprint, ext);
+                None
+            }
         }
     }
 
-    /// Store an artifact under its fingerprint.
+    /// Store an artifact under its fingerprint and record its checksum.
     pub fn store(&self, fingerprint: &str, ext: &str, src: &Path) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
         let dst = self.entry(fingerprint, ext);
-        if dst.is_file() {
+        if dst.is_file() && self.read_meta(fingerprint, ext).is_some() {
             return Ok(());
         }
         crate::util::atomic_copy(src, &dst)
-            .with_context(|| format!("cannot store cache entry `{}`", dst.display()))
+            .with_context(|| format!("cannot store cache entry `{}`", dst.display()))?;
+        let hash = crate::hash::hash_file(&dst)
+            .with_context(|| format!("cannot checksum cache entry `{}`", dst.display()))?;
+        let len = fs::metadata(&dst)?.len();
+        let meta = ObjectMeta { hash, len };
+        let text = serde_json::to_string(&meta)?;
+        crate::util::atomic_write(&self.meta_entry(fingerprint, ext), text.as_bytes())
+            .with_context(|| format!("cannot store cache metadata for `{}`", dst.display()))
     }
 
     /// All cached variants of a step, keyed by its dependency-independent
@@ -154,6 +205,27 @@ mod tests {
         fs::write(&src, b"object").unwrap();
         cache.store("abcdef", "o", &src).unwrap();
         assert!(cache.artifact("abcdef", "o").is_none());
+    }
+
+    #[test]
+    fn corrupted_objects_are_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path(), true);
+        let src = dir.path().join("a.o");
+        fs::write(&src, b"object").unwrap();
+        cache.store("abcdef1234", "o", &src).unwrap();
+        assert!(cache.artifact("abcdef1234", "o").is_some());
+
+        // Same length, different bytes: only the checksum can catch this.
+        fs::write(cache.entry("abcdef1234", "o"), b"0bject").unwrap();
+        assert!(cache.artifact("abcdef1234", "o").is_none());
+        assert!(!cache.entry("abcdef1234", "o").exists());
+        assert!(!cache.meta_entry("abcdef1234", "o").exists());
+
+        // Objects without metadata are treated as misses instead of trusted.
+        cache.store("abcdef1234", "o", &src).unwrap();
+        fs::remove_file(cache.meta_entry("abcdef1234", "o")).unwrap();
+        assert!(cache.artifact("abcdef1234", "o").is_none());
     }
 
     #[test]
