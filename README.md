@@ -351,7 +351,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-测试包含单元测试与端到端 CLI 测试；端到端测试在没有 C 编译器时会自动跳过。
+测试包含单元测试、库 API 测试（`tests/lib.rs`，直接调用 `Config`/`Planner`/`Cache`/`hash`）与端到端 CLI 测试；依赖 C 编译器的测试在缺少编译器时会自动跳过。
 
 本仓库的示例：
 
