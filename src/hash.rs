@@ -5,9 +5,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+
+/// Number of independently locked hash maps. Builds of large projects call
+/// `hash` hundreds of thousands of times, so spreading the lookups across
+/// shards removes most of the mutex contention between compiler workers.
+const SHARDS: usize = 16;
 
 /// Hash an in-memory byte slice.
 pub fn hash_bytes(bytes: &[u8]) -> String {
@@ -30,18 +34,15 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-#[derive(Clone)]
-struct CachedHash {
-    mtime: Option<SystemTime>,
-    size: u64,
-    hash: String,
-}
-
 /// A small in-process memoizer that avoids re-reading unchanged files during a
-/// single build. Comparing (mtime, size) is enough to catch edits; BLAKE3 then
-/// guarantees content correctness across builds.
+/// single build.
+///
+/// Each file's content is hashed at most once per build. A build reserves the
+/// right to assume inputs do not change underneath it: the scheduler guarantees
+/// that every input is read only after the step that produces it has finished.
+/// Across builds the cache starts empty, so edits are still picked up.
 pub struct FileHasher {
-    cache: Mutex<HashMap<PathBuf, CachedHash>>,
+    shards: Vec<Mutex<HashMap<PathBuf, String>>>,
 }
 
 impl Default for FileHasher {
@@ -53,32 +54,35 @@ impl Default for FileHasher {
 impl FileHasher {
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
         }
     }
 
-    pub fn hash(&self, path: &Path) -> Result<String> {
-        let meta = fs::metadata(path)
-            .with_context(|| format!("cannot read input `{}`", path.display()))?;
-        let mtime = meta.modified().ok();
-        let size = meta.len();
+    fn shard(&self, path: &Path) -> &Mutex<HashMap<PathBuf, String>> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.shards.len();
+        &self.shards[idx]
+    }
 
-        if let Some(cached) = self.cache.lock().unwrap().get(path) {
-            if cached.size == size && cached.mtime == mtime {
-                return Ok(cached.hash.clone());
+    pub fn hash(&self, path: &Path) -> Result<String> {
+        {
+            let cache = self.shard(path).lock().unwrap();
+            if let Some(hash) = cache.get(path) {
+                return Ok(hash.clone());
             }
         }
 
+        // Report a clear error before attempting to read the file.
+        fs::metadata(path).with_context(|| format!("cannot read input `{}`", path.display()))?;
         let hash =
             hash_file(path).with_context(|| format!("cannot hash input `{}`", path.display()))?;
-        self.cache.lock().unwrap().insert(
-            path.to_path_buf(),
-            CachedHash {
-                mtime,
-                size,
-                hash: hash.clone(),
-            },
-        );
+        self.shard(path)
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), hash.clone());
         Ok(hash)
     }
 

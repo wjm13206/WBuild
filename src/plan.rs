@@ -112,6 +112,9 @@ pub struct Artifact {
     pub kind: Kind,
 }
 
+/// `(final step id, link inputs, shared-library dirs, extra outputs)`.
+type FinalizeResult = (usize, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>);
+
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -313,9 +316,7 @@ impl<'a> Planner<'a> {
             }
             Kind::Object => self.plan_object_target(name, target),
             Kind::Custom => self.plan_custom(name, target),
-            Kind::Exe | Kind::Staticlib | Kind::Sharedlib => {
-                self.plan_cc_target(name, target)
-            }
+            Kind::Exe | Kind::Staticlib | Kind::Sharedlib => self.plan_cc_target(name, target),
         }
     }
 
@@ -383,8 +384,7 @@ impl<'a> Planner<'a> {
 
     /// `kind = "object"`: compile every source but stop before linking.
     fn plan_object_target(&mut self, name: &str, target: &Target) -> Result<()> {
-        let (objects, compile_ids, _os) =
-            self.compile_sources_to_objects(name, target, false)?;
+        let (objects, compile_ids, _os) = self.compile_sources_to_objects(name, target, false)?;
 
         let mut dep_final_steps = Vec::new();
         for dep in &target.links {
@@ -541,6 +541,7 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_compile(
         &mut self,
         target_name: &str,
@@ -695,7 +696,7 @@ impl<'a> Planner<'a> {
         dep_link_inputs: &[PathBuf],
         dep_shared_dirs: &[PathBuf],
         os: &str,
-    ) -> Result<(usize, Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
+    ) -> Result<FinalizeResult> {
         let output = self.default_output(name, target, os);
         let mut inputs: Vec<PathBuf> = objects.to_vec();
         inputs.extend(dep_link_inputs.iter().cloned());
@@ -856,6 +857,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_step(
         &mut self,
         target_name: &str,
@@ -1400,13 +1402,7 @@ fn expand_sources(
     target_name: &str,
     target: &Target,
 ) -> Result<Vec<PathBuf>> {
-    expand_paths(
-        loaded,
-        target_name,
-        &target.sources,
-        &target.exclude,
-        true,
-    )
+    expand_paths(loaded, target_name, &target.sources, &target.exclude, true)
 }
 
 fn expand_inputs(
@@ -1444,6 +1440,8 @@ fn expand_paths(
     only_languages: bool,
 ) -> Result<Vec<PathBuf>> {
     let root = &loaded.root;
+    let root_text = root.to_string_lossy().replace('\\', "/");
+    let root_text = root_text.trim_end_matches('/');
     let mut files: Vec<PathBuf> = Vec::new();
     let mut explicit_missing: Vec<String> = Vec::new();
     let accepted = |path: &Path| !only_languages || language_of(path).is_some();
@@ -1465,13 +1463,7 @@ fn expand_paths(
         }
 
         if has_glob_meta(pattern) {
-            let pattern_text = format!(
-                "{}/{}",
-                root.to_string_lossy()
-                    .replace('\\', "/")
-                    .trim_end_matches('/'),
-                pattern.replace('\\', "/")
-            );
+            let pattern_text = format!("{}/{}", root_text, pattern.replace('\\', "/"));
             let entries = glob::glob(&pattern_text)
                 .with_context(|| format!("invalid input pattern `{pattern}`"))?;
             for entry in entries {
@@ -1509,13 +1501,7 @@ fn expand_paths(
         for pattern in exclude {
             let full = util::abs_path(root, pattern);
             if has_glob_meta(pattern) {
-                let pattern_text = format!(
-                    "{}/{}",
-                    root.to_string_lossy()
-                        .replace('\\', "/")
-                        .trim_end_matches('/'),
-                    pattern.replace('\\', "/")
-                );
+                let pattern_text = format!("{}/{}", root_text, pattern.replace('\\', "/"));
                 if let Ok(entries) = glob::glob(&pattern_text) {
                     for entry in entries.flatten() {
                         excluded.insert(util::normalize(&entry));
@@ -1534,7 +1520,7 @@ fn expand_paths(
         files.retain(|f| !excluded.contains(&util::normalize(f)));
     }
 
-    files.sort_by_key(|p| util::path_key(p));
+    files.sort_by_cached_key(|p| util::path_key(p));
     files.dedup();
     Ok(files)
 }
@@ -1606,7 +1592,7 @@ fn cargo_inputs(manifest: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    inputs.sort_by_key(|p| util::path_key(p));
+    inputs.sort_by_cached_key(|p| util::path_key(p));
     inputs.dedup();
     inputs
 }

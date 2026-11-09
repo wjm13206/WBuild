@@ -44,7 +44,11 @@ cargo install --path .
 cargo build --release
 ```
 
+需要 Rust 1.89 或更新版本（构建锁使用标准库的文件锁 API）。
+
 编译产物为 `target/release/wbuild`（Windows 为 `wbuild.exe`）。
+
+> Windows 提示：若只安装了 MSVC 工具链但缺少 `link.exe`，请改用 GNU 工具链：`rustup default stable-x86_64-pc-windows-gnu`，或在构建时设置 `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu`。
 
 ## 快速开始
 
@@ -320,7 +324,7 @@ sysroot = "/opt/sysroot/aarch64"
 - 撤销一次修改 → 可直接命中此前缓存的产物；
 - `wbuild clean`（保留 `.wbuild/cache`）后再次构建 → 仍能命中缓存。
 
-状态与缓存写入均使用临时文件 + 原子替换；同一项目同时只允许一个构建进程（锁文件）。缺失的依赖文件会使指纹失配并触发重建，避免使用过期产物。
+状态与缓存写入均使用临时文件 + 原子替换；同一项目同时只允许一个构建进程（操作系统文件锁，进程退出后自动释放，崩溃或中断不会留下需要手工删除的死锁）。缺失的依赖文件会使指纹失配并触发重建，避免使用过期产物。
 
 ## 架构
 
@@ -354,6 +358,30 @@ cargo clippy --all-targets
 - `examples/hello`：C 可执行文件 + 静态库，多目标、头文件传递、debug/release。
 - `examples/rust-hello`：直接使用 `rustc` 构建。
 - `examples/cargo-hello`：包装现有 Cargo 项目。
+
+## 基准测试
+
+`bench/run-bench.ps1` 生成同一个包含 120 个 C 翻译单元的项目，分别用 Make、Ninja、CMake+Ninja 与 WBuild 构建，取 3 次运行的中位数。完整数据与机器信息见 [`bench/RESULTS.md`](bench/RESULTS.md)。
+
+实测环境：Intel Core 5 120U（12 逻辑核）、Windows、gcc 16.1.0（MinGW-W64 UCRT）、Ninja 1.13.2、CMake 4.4.1；统一使用 `-j 12` 与 `-O0 -g`。
+
+| 工具 | 冷构建 | 无改动重建 | 单文件增量 |
+| --- | ---: | ---: | ---: |
+| Make | 3551 ms | 362 ms | 611 ms |
+| Ninja | 3365 ms | 25 ms | 312 ms |
+| CMake + Ninja | 3733 ms | 358 ms | 684 ms |
+| **WBuild** | **3542 ms** | **73 ms** | **186 ms** |
+
+冷构建与 Ninja 相差约 5%，差距主要来自 BLAKE3 内容指纹与依赖收集。无改动重建需要校验全部输入内容，因此慢于 Ninja（73 ms 对 25 ms），但仍远快于 Make 与 CMake+Ninja；单文件增量约为 Ninja 的 0.6 倍。`wbuild clean` 保留缓存后再构建耗时 168 ms，产物全部从本地缓存恢复。
+
+复现：
+
+```console
+cargo build --release
+powershell -ExecutionPolicy Bypass -File bench/run-bench.ps1 -Sources 120 -Runs 3
+```
+
+脚本只测量真实墙钟时间（包含进程启动），WBuild 冷构建使用 `--no-cache` 以保证对比公平；系统中没有可用 Make 时会自动跳过该行。
 
 ## 设计约束
 

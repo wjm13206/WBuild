@@ -165,7 +165,10 @@ fn run_and_test_commands() {
     );
     let text = stdout(&run_out);
     assert!(text.contains("running app"), "missing run banner:\n{text}");
-    assert!(text.contains("arg=hello"), "argument was not forwarded:\n{text}");
+    assert!(
+        text.contains("arg=hello"),
+        "argument was not forwarded:\n{text}"
+    );
 
     let test_out = run(dir.path(), &["test"]);
     assert!(
@@ -318,7 +321,10 @@ fn generated_sources_are_built_before_consumers() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (program, args) = if cfg!(windows) {
-        ("cmd", "\"/C\", \"copy\", \"/Y\", \"part_template.c\", \"generated.c\"")
+        (
+            "cmd",
+            "\"/C\", \"copy\", \"/Y\", \"part_template.c\", \"generated.c\"",
+        )
     } else {
         ("cp", "\"-f\", \"part_template.c\", \"generated.c\"")
     };
@@ -357,11 +363,10 @@ links = ["gen"]
         "build with a generated source failed: {}",
         stderr(&first)
     );
-    let app = dir.path().join("build/debug").join(if cfg!(windows) {
-        "app.exe"
-    } else {
-        "app"
-    });
+    let app = dir
+        .path()
+        .join("build/debug")
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
     assert!(app.is_file(), "missing artifact {}", app.display());
 
     let executed = run(dir.path(), &["run", "app"]);

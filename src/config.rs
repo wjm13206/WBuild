@@ -535,7 +535,13 @@ impl Target {
         }
         match self.kind {
             Kind::Custom => {
-                if self.program.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                if self
+                    .program
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     bail!("target `{name}`: kind \"custom\" requires `program`");
                 }
                 if self.outputs.is_empty() {

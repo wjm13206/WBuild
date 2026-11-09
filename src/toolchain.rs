@@ -4,14 +4,35 @@
 //! and always yields concrete executable paths. The planner never guesses how to
 //! invoke a tool; it asks the `Toolchain`.
 
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Compiler;
 use crate::hash::Fingerprint;
 use crate::util;
+
+const CACHE_VERSION: u32 = 1;
+const CACHE_FILE: &str = "toolchain.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedTool {
+    modified: Option<u64>,
+    size: u64,
+    family: String,
+    version: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ToolCache {
+    version: u32,
+    tools: BTreeMap<String, CachedTool>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -68,6 +89,20 @@ pub struct Toolchain {
 
 impl Toolchain {
     pub fn detect(compiler: &Compiler, root: &Path) -> Result<Self> {
+        Self::detect_with(compiler, root, None)
+    }
+
+    /// Like [`Toolchain::detect`], but memoizes compiler versions in `state_dir`.
+    ///
+    /// A build normally runs 4-6 short-lived compiler processes just to learn
+    /// their versions. That is pure overhead on every incremental build, so the
+    /// results are cached against (path, mtime, size) and revalidated with a
+    /// single stat per tool.
+    pub fn detect_cached(compiler: &Compiler, root: &Path, state_dir: &Path) -> Result<Self> {
+        Self::detect_with(compiler, root, Some(state_dir))
+    }
+
+    fn detect_with(compiler: &Compiler, root: &Path, cache_dir: Option<&Path>) -> Result<Self> {
         let extra: Vec<PathBuf> = compiler
             .extra_paths
             .iter()
@@ -77,31 +112,117 @@ impl Toolchain {
         let target = compiler.target.clone();
         let sysroot = compiler.sysroot.as_ref().map(|s| util::abs_path(root, s));
 
-        let cc = resolve_tool(
+        let cache = cache_dir.map(load_cache).unwrap_or_default();
+        let mut probes: HashMap<PathBuf, (Family, String)> = HashMap::new();
+        let mut used: BTreeMap<String, CachedTool> = BTreeMap::new();
+
+        // Resolve every configured tool to a concrete path first. Path lookups
+        // are cheap; only probing (which spawns a process) is expensive.
+        let cc_path = resolve_path(
             &compiler.cc,
             "WBUILD_CC",
             &cc_candidates(target.as_deref()),
             &extra,
         );
-        let cxx = resolve_tool(
+        let cxx_path = resolve_path(
             &compiler.cxx,
             "WBUILD_CXX",
             &cxx_candidates(target.as_deref()),
             &extra,
         );
-        let linker = if compiler.linker == "auto" {
-            cc.clone()
-        } else {
-            resolve_tool(&compiler.linker, "WBUILD_LINKER", &[], &extra)
-        };
-        let asm = resolve_tool(&compiler.asm, "WBUILD_ASM", &["nasm".to_string()], &extra);
-        let rustc = resolve_tool(
+        let asm_path = resolve_path(&compiler.asm, "WBUILD_ASM", &["nasm".to_string()], &extra);
+        let rustc_path = resolve_path(
             &compiler.rustc,
             "WBUILD_RUSTC",
             &["rustc".to_string()],
             &extra,
         );
-        let ar = if compiler.ar == "auto" {
+        let linker_path = if compiler.linker == "auto" {
+            None
+        } else {
+            resolve_path(&compiler.linker, "WBUILD_LINKER", &[], &extra)
+        };
+
+        let mut paths: Vec<&PathBuf> = Vec::new();
+        for path in [&cc_path, &cxx_path, &asm_path, &rustc_path, &linker_path]
+            .into_iter()
+            .flatten()
+        {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+
+        // Split into cache hits and paths that need a real probe, then run all
+        // probes concurrently instead of one compiler process after another.
+        let mut pending: Vec<(PathBuf, u64, Option<u64>)> = Vec::new();
+        for path in paths {
+            let key = util::path_key(path);
+            let (size, modified) = file_stamp(path);
+            if let Some(cached) = cache.tools.get(&key) {
+                if cached.size == size && cached.modified == modified {
+                    probes.insert(
+                        path.clone(),
+                        (family_from_str(&cached.family), cached.version.clone()),
+                    );
+                    used.insert(key, cached.clone());
+                    continue;
+                }
+            }
+            pending.push((path.clone(), size, modified));
+        }
+
+        if !pending.is_empty() {
+            let probed = std::thread::scope(|scope| {
+                let handles: Vec<_> = pending
+                    .iter()
+                    .map(|(path, _, _)| scope.spawn(move || (path.clone(), probe_at(path))))
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect::<Vec<_>>()
+            });
+            for (path, (family, version)) in probed {
+                if let Some((_, size, modified)) = pending.iter().find(|(p, _, _)| p == &path) {
+                    used.insert(
+                        util::path_key(&path),
+                        CachedTool {
+                            modified: *modified,
+                            size: *size,
+                            family: family.as_str().to_string(),
+                            version: version.clone(),
+                        },
+                    );
+                }
+                probes.insert(path, (family, version));
+            }
+        }
+
+        let tool = |path: &Option<PathBuf>| -> Option<Tool> {
+            let path = path.as_ref()?;
+            let (family, version) = probes.get(path)?.clone();
+            Some(Tool {
+                path: path.clone(),
+                family,
+                version,
+            })
+        };
+
+        let cc = tool(&cc_path);
+        let cxx = tool(&cxx_path);
+        let asm = tool(&asm_path);
+        let rustc = tool(&rustc_path);
+        let linker = if compiler.linker == "auto" {
+            cc.clone()
+        } else {
+            tool(&linker_path)
+        };
+
+        // The archiver choice depends on the compiler family, so it is resolved
+        // after the C compiler has been identified.
+        let mut ar = None;
+        if compiler.ar == "auto" {
             let family = cc.as_ref().map(|t| t.family);
             let candidates: Vec<String> = match family {
                 Some(Family::Msvc) => vec!["lib".to_string()],
@@ -115,10 +236,30 @@ impl Toolchain {
                     v
                 }
             };
-            resolve_tool("auto", "WBUILD_AR", &candidates, &extra)
-        } else {
-            resolve_tool(&compiler.ar, "WBUILD_AR", &[], &extra)
-        };
+            if let Some(path) = resolve_path("auto", "WBUILD_AR", &candidates, &extra) {
+                let (family, version) = lookup_or_probe(&path, &cache, &mut probes, &mut used);
+                ar = Some(Tool {
+                    path,
+                    family,
+                    version,
+                });
+            }
+        } else if let Some(path) = resolve_path(&compiler.ar, "WBUILD_AR", &[], &extra) {
+            let (family, version) = lookup_or_probe(&path, &cache, &mut probes, &mut used);
+            ar = Some(Tool {
+                path,
+                family,
+                version,
+            });
+        }
+
+        if let Some(dir) = cache_dir {
+            let next = ToolCache {
+                version: CACHE_VERSION,
+                tools: used,
+            };
+            let _ = save_cache(dir, &next);
+        }
 
         let host_os = std::env::consts::OS;
 
@@ -255,12 +396,12 @@ fn cxx_candidates(target: Option<&str>) -> Vec<String> {
     v
 }
 
-fn resolve_tool(
+fn resolve_path(
     configured: &str,
     env_var: &str,
     auto_candidates: &[String],
     extra_paths: &[PathBuf],
-) -> Option<Tool> {
+) -> Option<PathBuf> {
     let requested = std::env::var(env_var)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -268,47 +409,103 @@ fn resolve_tool(
     let requested = requested.trim();
 
     if requested != "auto" {
-        let found = find_tool(requested, extra_paths).or_else(|| {
-            // A bare name that was not found: report nothing, detection is
-            // best-effort. The planner emits a precise error if it is needed.
-            if requested.contains('/') || requested.contains('\\') {
-                let p = PathBuf::from(requested);
-                if p.is_file() {
-                    probe(&p)
-                } else {
-                    None
-                }
-            } else {
-                None
+        if let Some(path) = util::find_program(requested, extra_paths) {
+            return Some(path);
+        }
+        // A configured path that `find_program` did not accept may still be a
+        // direct file reference.
+        if requested.contains('/') || requested.contains('\\') {
+            let path = PathBuf::from(requested);
+            if path.is_file() {
+                return Some(path);
             }
-        });
-        return found;
+        }
+        return None;
     }
 
-    for candidate in auto_candidates {
-        if let Some(tool) = find_tool(candidate, extra_paths) {
-            return Some(tool);
+    auto_candidates
+        .iter()
+        .find_map(|candidate| util::find_program(candidate, extra_paths))
+}
+
+/// Resolve a single tool, reusing the in-memory probe map or the on-disk cache
+/// when possible.
+fn lookup_or_probe(
+    path: &Path,
+    cache: &ToolCache,
+    probes: &mut HashMap<PathBuf, (Family, String)>,
+    used: &mut BTreeMap<String, CachedTool>,
+) -> (Family, String) {
+    if let Some(value) = probes.get(path) {
+        return value.clone();
+    }
+
+    let key = util::path_key(path);
+    let (size, modified) = file_stamp(path);
+    if let Some(cached) = cache.tools.get(&key) {
+        if cached.size == size && cached.modified == modified {
+            let value = (family_from_str(&cached.family), cached.version.clone());
+            probes.insert(path.to_path_buf(), value.clone());
+            used.insert(key, cached.clone());
+            return value;
         }
     }
-    None
+
+    let value = probe_at(path);
+    used.insert(
+        key,
+        CachedTool {
+            modified,
+            size,
+            family: value.0.as_str().to_string(),
+            version: value.1.clone(),
+        },
+    );
+    probes.insert(path.to_path_buf(), value.clone());
+    value
 }
 
-fn find_tool(name: &str, extra_paths: &[PathBuf]) -> Option<Tool> {
-    let path = util::find_program(name, extra_paths)?;
-    probe(&path)
+fn file_stamp(path: &Path) -> (u64, Option<u64>) {
+    let Ok(meta) = fs::metadata(path) else {
+        return (0, None);
+    };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64);
+    (meta.len(), modified)
 }
 
-fn probe(path: &Path) -> Option<Tool> {
+fn probe_at(path: &Path) -> (Family, String) {
     let family = family_from_name(path);
-
     let version = probe_version(path).unwrap_or_else(|| "unknown".to_string());
     let family = family_from_version(&version).unwrap_or(family);
+    (family, version)
+}
 
-    Some(Tool {
-        path: path.to_path_buf(),
-        family,
-        version,
-    })
+fn family_from_str(name: &str) -> Family {
+    match name {
+        "clang" => Family::Clang,
+        "msvc" => Family::Msvc,
+        _ => Family::Gcc,
+    }
+}
+
+fn load_cache(dir: &Path) -> ToolCache {
+    let Ok(text) = fs::read_to_string(dir.join(CACHE_FILE)) else {
+        return ToolCache::default();
+    };
+    match serde_json::from_str::<ToolCache>(&text) {
+        Ok(cache) if cache.version == CACHE_VERSION => cache,
+        _ => ToolCache::default(),
+    }
+}
+
+fn save_cache(dir: &Path, cache: &ToolCache) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(cache)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    util::atomic_write(&dir.join(CACHE_FILE), &bytes)
 }
 
 fn probe_version(path: &Path) -> Option<String> {
@@ -331,8 +528,9 @@ fn probe_version(path: &Path) -> Option<String> {
             .unwrap_or("");
         if !line.is_empty() {
             let mut line = line.to_string();
-            if line.len() > 200 {
-                line.truncate(200);
+            const MAX: usize = 200;
+            if line.chars().count() > MAX {
+                line = line.chars().take(MAX).collect();
             }
             return Some(line);
         }

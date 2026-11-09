@@ -6,4 +6,3 @@ out_dir = "build"
 kind = "rust"
 sources = ["src/main.rs"]
 edition = "2021"
-target = "x86_64-pc-windows-gnu"

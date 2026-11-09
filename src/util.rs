@@ -204,8 +204,10 @@ pub fn format_duration(d: Duration) -> String {
 /// Shorten a single line for inline logging.
 pub fn one_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or("").trim().to_string();
-    if line.len() > 160 {
-        format!("{}...", &line[..157])
+    const MAX: usize = 160;
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX - 3).collect();
+        format!("{truncated}...")
     } else {
         line
     }

@@ -1,10 +1,9 @@
 //! Build orchestration and user-facing reporting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -96,10 +95,10 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
     let state_path = state_dir.join("state.json");
     let mut state = State::load(&state_path)?;
 
-    let toolchain = Toolchain::detect(&loaded.config.compiler, &loaded.root)?;
+    let toolchain = Toolchain::detect_cached(&loaded.config.compiler, &loaded.root, &state_dir)?;
     let plan = Planner::build(loaded, &profile, &toolchain, &req.targets)?;
 
-    let jobs = req.jobs.unwrap_or(loaded.config.build.jobs).max(0);
+    let jobs = req.jobs.unwrap_or(loaded.config.build.jobs);
     let jobs = if jobs == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -109,9 +108,9 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
     };
 
     let cache_enabled = loaded.config.build.cache && !req.no_cache && !req.force;
-    let ctx = Arc::new(ExecContext {
+    let ctx = ExecContext {
         root: loaded.root.clone(),
-        state: state.clone(),
+        state: &state,
         cache: Cache::new(&state_dir, cache_enabled),
         hasher: FileHasher::new(),
         toolchain_fp: toolchain.fingerprint.clone(),
@@ -125,7 +124,7 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
             explain: req.explain,
             no_cache: req.no_cache,
         },
-    });
+    };
 
     let painter = Painter::new(util::use_color() && !req.quiet);
     if !req.quiet {
@@ -147,7 +146,7 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
     let interactive = !req.quiet;
     let total = plan.total_steps();
 
-    let report = exec::run(&plan, ctx.clone(), |outcome, done, total| {
+    let report = exec::run(&plan, &ctx, |outcome, done, total| {
         if !interactive {
             return;
         }
@@ -180,7 +179,12 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
                 },
             );
         }
-        state.prune(&loaded.root);
+        let keep: HashSet<String> = plan
+            .steps
+            .iter()
+            .map(|step| util::display_path(&loaded.root, &step.output))
+            .collect();
+        state.prune(&loaded.root, &keep);
         state.save(&state_path)?;
     }
 
@@ -663,11 +667,11 @@ fn default_runnable_target(loaded: &LoadedConfig) -> Result<String> {
     )
 }
 
-fn find_artifact<'a>(
-    summary: &'a BuildSummary,
-    name: &str,
-) -> Option<&'a (String, PathBuf, bool)> {
-    summary.artifacts.iter().find(|(target, _, _)| target == name)
+fn find_artifact<'a>(summary: &'a BuildSummary, name: &str) -> Option<&'a (String, PathBuf, bool)> {
+    summary
+        .artifacts
+        .iter()
+        .find(|(target, _, _)| target == name)
 }
 
 /// Build the selected target, then execute its artifact with `args`.
@@ -862,8 +866,8 @@ pub fn profile_report(loaded: &LoadedConfig) -> Result<()> {
             path.display()
         );
     }
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("cannot read `{}`", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("cannot read `{}`", path.display()))?;
     let json: serde_json::Value =
         serde_json::from_str(&text).with_context(|| "cannot parse timing report")?;
     let profile = json
@@ -894,10 +898,7 @@ pub fn profile_report(loaded: &LoadedConfig) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
         let target = step.get("target").and_then(|v| v.as_str()).unwrap_or("");
-        let status = step
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let status = step.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let ms = step
             .get("duration_ms")
             .and_then(|v| v.as_u64())
@@ -957,11 +958,7 @@ pub fn cache(loaded: &LoadedConfig, action: CacheAction) -> Result<()> {
                 }
             }
             println!("cache     {}", root.display());
-            println!(
-                "  objects {} ({})",
-                objects,
-                format_bytes(bytes)
-            );
+            println!("  objects {} ({})", objects, format_bytes(bytes));
             println!("  index   {indexes} command(s)");
         }
     }
@@ -986,6 +983,10 @@ fn format_bytes(bytes: u64) -> String {
 /// Print version and host information; works outside a project.
 pub fn version() {
     println!("WBuild {}", env!("CARGO_PKG_VERSION"));
-    println!("  host      {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  host      {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!("  cache     content-addressed local cache");
 }

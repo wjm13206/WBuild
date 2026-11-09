@@ -8,7 +8,6 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,7 @@ use crate::plan::{DepSource, Plan, Step, StepKind};
 use crate::state::State;
 use crate::util;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecOptions {
     pub jobs: usize,
     pub force: bool,
@@ -32,21 +31,6 @@ pub struct ExecOptions {
     pub print_commands: bool,
     pub explain: bool,
     pub no_cache: bool,
-}
-
-impl Default for ExecOptions {
-    fn default() -> Self {
-        Self {
-            jobs: 0,
-            force: false,
-            dry_run: false,
-            verbose: false,
-            quiet: false,
-            print_commands: false,
-            explain: false,
-            no_cache: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +63,9 @@ impl StepOutcome {
     }
 }
 
-pub struct ExecContext {
+pub struct ExecContext<'a> {
     pub root: PathBuf,
-    pub state: State,
+    pub state: &'a State,
     pub cache: Cache,
     pub hasher: FileHasher,
     pub toolchain_fp: String,
@@ -98,35 +82,16 @@ pub struct RunReport {
 ///
 /// `on_done` is called from the coordinating thread, one step at a time, which
 /// keeps reporting deterministic even with many workers.
-pub fn run<F>(plan: &Plan, ctx: Arc<ExecContext>, mut on_done: F) -> RunReport
+pub fn run<'a, F>(plan: &'a Plan, ctx: &'a ExecContext<'a>, mut on_done: F) -> RunReport
 where
     F: FnMut(&StepOutcome, usize, usize),
 {
     let started = Instant::now();
     let total = plan.steps.len();
-    let steps = Arc::new(plan.steps.clone());
     let jobs = effective_jobs(ctx.options.jobs, total);
 
     let (job_tx, job_rx) = unbounded::<usize>();
     let (res_tx, res_rx) = unbounded::<StepOutcome>();
-
-    let mut handles = Vec::new();
-    for _ in 0..jobs {
-        let job_rx = job_rx.clone();
-        let res_tx = res_tx.clone();
-        let steps = steps.clone();
-        let ctx = ctx.clone();
-        handles.push(thread::spawn(move || {
-            while let Ok(id) = job_rx.recv() {
-                let outcome = execute_step(&steps[id], &ctx);
-                if res_tx.send(outcome).is_err() {
-                    break;
-                }
-            }
-        }));
-    }
-    drop(job_rx);
-    drop(res_tx);
 
     let mut indegree = plan.dag.indegree.clone();
     let priority = critical_priorities(&plan.dag, total);
@@ -139,49 +104,71 @@ where
     let mut completed = 0usize;
     let mut failed = false;
 
-    loop {
-        while !failed && running < jobs {
-            let Some((_, Reverse(id))) = ready.pop() else {
-                break;
-            };
-            if job_tx.send(id).is_err() {
+    // Scoped threads let every worker borrow the plan and execution context
+    // directly. This avoids cloning the whole step list and state on every
+    // build, which used to dominate startup time on large projects.
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(jobs);
+        for _ in 0..jobs {
+            let job_rx = job_rx.clone();
+            let res_tx = res_tx.clone();
+            handles.push(scope.spawn(move || {
+                while let Ok(id) = job_rx.recv() {
+                    let outcome = execute_step(&plan.steps[id], ctx);
+                    if res_tx.send(outcome).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(job_rx);
+        drop(res_tx);
+
+        loop {
+            while !failed && running < jobs {
+                let Some((_, Reverse(id))) = ready.pop() else {
+                    break;
+                };
+                if job_tx.send(id).is_err() {
+                    break;
+                }
+                running += 1;
+            }
+
+            if running == 0 {
                 break;
             }
-            running += 1;
-        }
 
-        if running == 0 {
-            break;
-        }
+            let Ok(outcome) = res_rx.recv() else {
+                break;
+            };
+            running -= 1;
+            completed += 1;
 
-        let Ok(outcome) = res_rx.recv() else {
-            break;
-        };
-        running -= 1;
-        completed += 1;
+            let id = outcome.step_id;
+            let ok = outcome.succeeded();
+            if !ok {
+                failed = true;
+            }
+            on_done(&outcome, completed, total);
+            results[id] = Some(outcome);
 
-        let id = outcome.step_id;
-        let ok = outcome.succeeded();
-        if !ok {
-            failed = true;
-        }
-        on_done(&outcome, completed, total);
-        results[id] = Some(outcome);
-
-        if ok {
-            for &next in &plan.dag.dependents[id] {
-                indegree[next] -= 1;
-                if indegree[next] == 0 {
-                    ready.push((priority[next], Reverse(next)));
+            if ok {
+                for &next in &plan.dag.dependents[id] {
+                    indegree[next] -= 1;
+                    if indegree[next] == 0 {
+                        ready.push((priority[next], Reverse(next)));
+                    }
                 }
             }
         }
-    }
 
-    drop(job_tx);
-    for handle in handles {
-        let _ = handle.join();
-    }
+        drop(job_tx);
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+
     // Drain any results still in flight (normally none).
     while let Ok(outcome) = res_rx.try_recv() {
         let id = outcome.step_id;
@@ -226,8 +213,14 @@ fn critical_priorities(dag: &crate::graph::Dag, total: usize) -> Vec<usize> {
     priority
 }
 
-fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
+fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
     let started = Instant::now();
+    // Building the full command line is only useful when it will be shown.
+    let command = if ctx.options.verbose || ctx.options.print_commands {
+        step.command_line()
+    } else {
+        String::new()
+    };
     let base = |status: StepStatus, reason: &str| StepOutcome {
         step_id: step.id,
         target: step.target.clone(),
@@ -238,15 +231,15 @@ fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
         deps: Vec::new(),
         output: String::new(),
         exit_code: None,
-        command: step.command_line(),
+        command: command.clone(),
         reason: reason.to_string(),
     };
 
     let key = util::display_path(&ctx.root, &step.output);
-    let record = ctx.state.record(&key).cloned();
-    let prev_deps = record.as_ref().map(|r| r.deps.clone()).unwrap_or_default();
+    let record = ctx.state.record(&key);
+    let prev_deps: &[String] = record.map(|r| r.deps.as_slice()).unwrap_or(&[]);
 
-    let fp_pre = match compute_fingerprint(step, &prev_deps, ctx) {
+    let fp_pre = match compute_fingerprint(step, prev_deps, ctx) {
         Ok(fp) => fp,
         Err(err) => {
             let mut outcome = base(StepStatus::Failed, &format!("{err:#}"));
@@ -255,22 +248,26 @@ fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
         }
     };
 
+    // Stat the outputs at most once per step; the answer is reused by both the
+    // rebuild reason and the up-to-date decision.
+    let outputs_present = !ctx.options.force && record.is_some() && outputs_exist(step);
     let reason = if ctx.options.force {
         "forced rebuild"
     } else if record.is_none() {
         "first build"
-    } else if !outputs_exist(step) {
+    } else if !outputs_present {
         "output missing"
     } else {
         "inputs or command changed"
     };
 
     if !ctx.options.force {
-        if let Some(record) = &record {
-            if record.fingerprint == fp_pre && outputs_exist(step) {
+        if let Some(record) = record {
+            if record.fingerprint == fp_pre && outputs_present {
                 let mut outcome = base(StepStatus::UpToDate, "up to date");
                 outcome.fingerprint = fp_pre;
-                outcome.deps = record.deps.clone();
+                // The persisted record already holds this step's dependency
+                // list, so there is no need to copy it into the outcome.
                 return outcome;
             }
         }
@@ -279,18 +276,23 @@ fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
     if ctx.options.dry_run {
         let mut outcome = base(StepStatus::DryRun, reason);
         outcome.fingerprint = fp_pre;
-        outcome.deps = prev_deps;
+        outcome.deps = prev_deps.to_vec();
         return outcome;
     }
 
     // Cache lookup. The command fingerprint deliberately excludes discovered
     // dependencies: they are validated separately against the cached variant's
     // dependency hash, so a cache entry survives `wbuild clean` and can be
-    // reused whenever the same headers are back in play.
+    // reused whenever the same headers are back in play. It is computed once
+    // and reused when storing the result below.
     let cache_enabled = ctx.cache.enabled() && !ctx.options.force && !ctx.options.no_cache;
-    if cache_enabled && step.cacheable {
-        let command_fp = compute_fingerprint(step, &[], ctx).unwrap_or_default();
-        for entry in ctx.cache.index(&command_fp) {
+    let command_fp = if cache_enabled && step.cacheable {
+        Some(compute_fingerprint(step, &[], ctx).unwrap_or_default())
+    } else {
+        None
+    };
+    if let Some(command_fp) = &command_fp {
+        for entry in ctx.cache.index(command_fp) {
             if deps_fingerprint(&entry.deps, ctx) != entry.hash {
                 continue;
             }
@@ -299,8 +301,12 @@ fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
             };
             match restore_cached(step, &cached, &ctx.root) {
                 Ok(()) => {
-                    let fp_post =
-                        compute_fingerprint(step, &entry.deps, ctx).unwrap_or(entry.entry);
+                    let fp_post = if entry.deps.as_slice() == prev_deps {
+                        fp_pre.clone()
+                    } else {
+                        compute_fingerprint(step, &entry.deps, ctx)
+                            .unwrap_or_else(|_| entry.entry.clone())
+                    };
                     let mut outcome = base(StepStatus::Cached, "cache hit");
                     outcome.fingerprint = fp_post;
                     outcome.deps = entry.deps;
@@ -375,28 +381,33 @@ fn execute_step(step: &Step, ctx: &ExecContext) -> StepOutcome {
     deps.sort();
     deps.dedup();
 
-    let fp_post = match compute_fingerprint(step, &deps, ctx) {
-        Ok(fp) => fp,
-        Err(err) => {
-            let mut outcome = base(StepStatus::Failed, &format!("{err:#}"));
-            outcome.output = format!("{err:#}");
-            return outcome;
+    let fp_post = if deps.as_slice() == prev_deps {
+        // Common case: the dependency set did not change, so the fingerprint
+        // computed before the build is still valid.
+        fp_pre.clone()
+    } else {
+        match compute_fingerprint(step, &deps, ctx) {
+            Ok(fp) => fp,
+            Err(err) => {
+                let mut outcome = base(StepStatus::Failed, &format!("{err:#}"));
+                outcome.output = format!("{err:#}");
+                return outcome;
+            }
         }
     };
 
-    if cache_enabled && step.cacheable {
+    if let Some(command_fp) = &command_fp {
         if let Err(err) = ctx.cache.store(&fp_post, step.cache_ext, &step.output) {
             if ctx.options.verbose {
                 eprintln!("warning: {err:#}");
             }
         }
-        let command_fp = compute_fingerprint(step, &[], ctx).unwrap_or_default();
         let entry = crate::cache::CacheEntry {
             hash: deps_fingerprint(&deps, ctx),
             deps: deps.clone(),
             entry: fp_post.clone(),
         };
-        if let Err(err) = ctx.cache.upsert(&command_fp, entry) {
+        if let Err(err) = ctx.cache.upsert(command_fp, entry) {
             if ctx.options.verbose {
                 eprintln!("warning: {err:#}");
             }
@@ -469,7 +480,7 @@ fn restore_cached(step: &Step, cached: &Path, root: &Path) -> Result<()> {
 }
 
 /// Compute the fingerprint for a step given its dependency set (stored paths).
-fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext) -> Result<String> {
+fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext<'_>) -> Result<String> {
     let mut fp = Fingerprint::new().tag("wbuild-step-v2");
     fp.text(&ctx.toolchain_fp);
     fp.text(step.kind.tag());
@@ -498,7 +509,7 @@ fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext) -> Resul
 /// Fingerprint of the discovered dependency set and the contents of every
 /// dependency. Used to validate cached variants whose command fingerprint is
 /// unchanged but whose headers may have moved on.
-fn deps_fingerprint(deps: &[String], ctx: &ExecContext) -> String {
+fn deps_fingerprint(deps: &[String], ctx: &ExecContext<'_>) -> String {
     let mut fp = Fingerprint::new().tag("wbuild-deps-v1");
     for dep in deps {
         let path = resolve_dep(&ctx.root, dep);
@@ -555,7 +566,7 @@ mod tests {
     #[test]
     fn dependency_paths_are_relativized() {
         let root = Path::new("C:/proj").to_path_buf();
-        let deps = vec!["C:/proj/src/a.h".to_string()];
+        let deps = ["C:/proj/src/a.h".to_string()];
         let resolved = resolve_dep(&root, &deps[0]);
         assert!(resolved.ends_with("a.h"));
     }
