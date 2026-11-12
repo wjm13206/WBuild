@@ -26,7 +26,11 @@ if (-not (Test-Path $wbuild)) {
     throw "missing $wbuild - run: cargo build --release"
 }
 
-$cpu = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+try {
+    $cpu = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+} catch {
+    $cpu = [Environment]::ProcessorCount
+}
 if ($Jobs -le 0) { $Jobs = $cpu }
 
 $cc = (Get-Command gcc).Source

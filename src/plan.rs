@@ -1779,13 +1779,26 @@ fn expand_paths(
         }
 
         if has_glob_meta(pattern) {
-            let pattern_text = format!("{}/{}", root_text, pattern.replace('\\', "/"));
-            let entries = glob::glob(&pattern_text)
-                .with_context(|| format!("invalid input pattern `{pattern}`"))?;
-            for entry in entries {
-                let path = entry.with_context(|| format!("error expanding `{pattern}`"))?;
-                if path.is_file() && accepted(&path) {
-                    files.push(path);
+            match expand_simple_glob(root, pattern) {
+                // A plain `dir/*.c` pattern is answered by one directory
+                // listing; the glob crate would stat every entry to classify it.
+                Some(paths) => {
+                    for path in paths {
+                        if accepted(&path) {
+                            files.push(path);
+                        }
+                    }
+                }
+                None => {
+                    let pattern_text = format!("{}/{}", root_text, pattern.replace('\\', "/"));
+                    let entries = glob::glob(&pattern_text)
+                        .with_context(|| format!("invalid input pattern `{pattern}`"))?;
+                    for entry in entries {
+                        let path = entry.with_context(|| format!("error expanding `{pattern}`"))?;
+                        if path.is_file() && accepted(&path) {
+                            files.push(path);
+                        }
+                    }
                 }
             }
             continue;
@@ -1839,6 +1852,80 @@ fn expand_paths(
     files.sort_by_cached_key(|p| util::path_key(p));
     files.dedup();
     Ok(files)
+}
+
+/// Expand a pattern of the form `dir/name*pattern` by listing `dir` once.
+///
+/// Returns `None` for anything the glob crate must handle itself: wildcards in
+/// directory components, `**`, character classes, or brace alternation.
+fn expand_simple_glob(root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
+    const META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+
+    let pattern = pattern.replace('\\', "/");
+    let pattern = pattern.trim_end_matches('/');
+    let (dir_part, name_part) = match pattern.rsplit_once('/') {
+        Some((dir, name)) => (dir, name),
+        None => ("", pattern),
+    };
+    if name_part.contains(['?', '[', ']', '{', '}']) || !name_part.contains('*') {
+        return None;
+    }
+    if dir_part.contains(META) {
+        return None;
+    }
+
+    let dir = util::abs_path(root, if dir_part.is_empty() { "." } else { dir_part });
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `DirEntry::file_type` comes free with the directory listing; only a
+        // symlink needs a follow-up stat to decide whether it points at a file.
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(file_type) if file_type.is_symlink() => {
+                if !path.is_file() {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+        if wildcard_match(&entry.file_name().to_string_lossy(), name_part) {
+            files.push(path);
+        }
+    }
+    Some(files)
+}
+
+/// Match a file name against a pattern where `*` stands for any run of
+/// characters. Backtracking is linear: the last `*` is the only one retried.
+fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let (mut t, mut p) = (0, 0);
+    let mut star: Option<usize> = None;
+    let mut resume = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            resume = t;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(s) = star {
+            p = s + 1;
+            resume += 1;
+            t = resume;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Resolve a custom target's `program`. Paths are resolved relative to the

@@ -112,7 +112,7 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
         root: loaded.root.clone(),
         state: &state,
         cache: Cache::new(&state_dir, cache_enabled),
-        hasher: FileHasher::new(),
+        hasher: FileHasher::open(&state_dir),
         toolchain_fp: toolchain.fingerprint.clone(),
         options: ExecOptions {
             jobs,
@@ -154,8 +154,19 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
         counts.observe(outcome);
     });
 
+    // Persist the file hash memo before the executor context is torn down.
+    // A no-op build computes no new hashes, so this writes nothing.
+    if !req.dry_run {
+        if let Err(err) = ctx.hasher.persist() {
+            if req.verbose {
+                eprintln!("warning: {err:#}");
+            }
+        }
+    }
+
     // Merge successful step records into the persistent state.
     if !req.dry_run {
+        let mut dirty = false;
         for (id, outcome) in report.outcomes.iter().enumerate() {
             let Some(outcome) = outcome else {
                 continue;
@@ -178,14 +189,21 @@ pub fn build(loaded: &LoadedConfig, req: &BuildRequest) -> Result<BuildSummary> 
                     updated: now_unix(),
                 },
             );
+            dirty = true;
         }
+        // A no-op build leaves every record untouched. Writing the state file
+        // back would only rewrite identical bytes, so skip it entirely.
         let keep: HashSet<String> = plan
             .steps
             .iter()
             .map(|step| util::display_path(&loaded.root, &step.output))
             .collect();
+        let before = state.steps.len();
         state.prune(&loaded.root, &keep);
-        state.save(&state_path)?;
+        dirty |= state.steps.len() != before;
+        if dirty {
+            state.save(&state_path)?;
+        }
     }
 
     let summary = summarize(&plan, &report, loaded, req, counts, total);

@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,10 +16,10 @@ use crate::config::Compiler;
 use crate::hash::Fingerprint;
 use crate::util;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_FILE: &str = "toolchain.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CachedTool {
     modified: Option<u64>,
     size: u64,
@@ -32,6 +31,10 @@ struct CachedTool {
 struct ToolCache {
     version: u32,
     tools: BTreeMap<String, CachedTool>,
+    /// Tool request ("WBUILD_CC=gcc") to the path it resolved to. Reusing the
+    /// recorded path turns a `PATH` scan into a single stat per tool.
+    #[serde(default)]
+    resolved: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,32 +118,57 @@ impl Toolchain {
         let cache = cache_dir.map(load_cache).unwrap_or_default();
         let mut probes: HashMap<PathBuf, (Family, String)> = HashMap::new();
         let mut used: BTreeMap<String, CachedTool> = BTreeMap::new();
+        let mut resolver = ToolResolver {
+            cache: &cache,
+            extra: &extra,
+            resolved: BTreeMap::new(),
+        };
 
         // Resolve every configured tool to a concrete path first. Path lookups
         // are cheap; only probing (which spawns a process) is expensive.
-        let cc_path = resolve_path(
+        let cc_path = resolver.resolve(
+            "cc",
             &compiler.cc,
             "WBUILD_CC",
             &cc_candidates(target.as_deref()),
-            &extra,
+            &mut probes,
+            &mut used,
         );
-        let cxx_path = resolve_path(
+        let cxx_path = resolver.resolve(
+            "cxx",
             &compiler.cxx,
             "WBUILD_CXX",
             &cxx_candidates(target.as_deref()),
-            &extra,
+            &mut probes,
+            &mut used,
         );
-        let asm_path = resolve_path(&compiler.asm, "WBUILD_ASM", &["nasm".to_string()], &extra);
-        let rustc_path = resolve_path(
+        let asm_path = resolver.resolve(
+            "asm",
+            &compiler.asm,
+            "WBUILD_ASM",
+            &["nasm".to_string()],
+            &mut probes,
+            &mut used,
+        );
+        let rustc_path = resolver.resolve(
+            "rustc",
             &compiler.rustc,
             "WBUILD_RUSTC",
             &["rustc".to_string()],
-            &extra,
+            &mut probes,
+            &mut used,
         );
         let linker_path = if compiler.linker == "auto" {
             None
         } else {
-            resolve_path(&compiler.linker, "WBUILD_LINKER", &[], &extra)
+            resolver.resolve(
+                "linker",
+                &compiler.linker,
+                "WBUILD_LINKER",
+                &[],
+                &mut probes,
+                &mut used,
+            )
         };
 
         let mut paths: Vec<&PathBuf> = Vec::new();
@@ -157,6 +185,10 @@ impl Toolchain {
         // probes concurrently instead of one compiler process after another.
         let mut pending: Vec<(PathBuf, u64, Option<u64>)> = Vec::new();
         for path in paths {
+            if probes.contains_key(path) {
+                // The resolver already validated this tool against the cache.
+                continue;
+            }
             let key = util::path_key(path);
             let (size, modified) = file_stamp(path);
             if let Some(cached) = cache.tools.get(&key) {
@@ -222,6 +254,10 @@ impl Toolchain {
         // The archiver choice depends on the compiler family, so it is resolved
         // after the C compiler has been identified.
         let mut ar = None;
+        let ar_role = format!(
+            "ar-{}",
+            cc.as_ref().map(|t| t.family.as_str()).unwrap_or("auto")
+        );
         if compiler.ar == "auto" {
             let family = cc.as_ref().map(|t| t.family);
             let candidates: Vec<String> = match family {
@@ -236,7 +272,14 @@ impl Toolchain {
                     v
                 }
             };
-            if let Some(path) = resolve_path("auto", "WBUILD_AR", &candidates, &extra) {
+            if let Some(path) = resolver.resolve(
+                &ar_role,
+                "auto",
+                "WBUILD_AR",
+                &candidates,
+                &mut probes,
+                &mut used,
+            ) {
                 let (family, version) = lookup_or_probe(&path, &cache, &mut probes, &mut used);
                 ar = Some(Tool {
                     path,
@@ -244,7 +287,14 @@ impl Toolchain {
                     version,
                 });
             }
-        } else if let Some(path) = resolve_path(&compiler.ar, "WBUILD_AR", &[], &extra) {
+        } else if let Some(path) = resolver.resolve(
+            &ar_role,
+            &compiler.ar,
+            "WBUILD_AR",
+            &[],
+            &mut probes,
+            &mut used,
+        ) {
             let (family, version) = lookup_or_probe(&path, &cache, &mut probes, &mut used);
             ar = Some(Tool {
                 path,
@@ -257,8 +307,17 @@ impl Toolchain {
             let next = ToolCache {
                 version: CACHE_VERSION,
                 tools: used,
+                resolved: resolver
+                    .resolved
+                    .iter()
+                    .map(|(key, path)| (key.clone(), util::path_key(path)))
+                    .collect(),
             };
-            let _ = save_cache(dir, &next);
+            // Revalidated entries are byte-for-byte identical, so an up-to-date
+            // toolchain should not rewrite the cache file on every build.
+            if next.tools != cache.tools || next.resolved != cache.resolved {
+                let _ = save_cache(dir, &next);
+            }
         }
 
         let host_os = std::env::consts::OS;
@@ -396,6 +455,66 @@ fn cxx_candidates(target: Option<&str>) -> Vec<String> {
     v
 }
 
+/// Resolves configured tool names to concrete paths, reusing the paths recorded
+/// by the previous build.
+///
+/// A `PATH` lookup walks every directory until it finds a match, which on a
+/// long `PATH` costs dozens of stats per tool on every build. Because a
+/// resolved path is only trusted while its stamp still matches the cached
+/// probe, a recorded path is as safe as a fresh lookup and much cheaper.
+struct ToolResolver<'a> {
+    cache: &'a ToolCache,
+    extra: &'a [PathBuf],
+    resolved: BTreeMap<String, PathBuf>,
+}
+
+impl<'a> ToolResolver<'a> {
+    fn resolve(
+        &mut self,
+        role: &str,
+        configured: &str,
+        env_var: &str,
+        auto_candidates: &[String],
+        probes: &mut HashMap<PathBuf, (Family, String)>,
+        used: &mut BTreeMap<String, CachedTool>,
+    ) -> Option<PathBuf> {
+        let key = request_key(role, env_var, configured);
+
+        if let Some(path) = self.cache.resolved.get(&key) {
+            let path = PathBuf::from(path);
+            let cached = self
+                .cache
+                .tools
+                .get(&util::path_key(&path))
+                .filter(|cached| (cached.size, cached.modified) == file_stamp(&path));
+            if let Some(cached) = cached {
+                probes.insert(
+                    path.clone(),
+                    (family_from_str(&cached.family), cached.version.clone()),
+                );
+                used.insert(util::path_key(&path), cached.clone());
+                self.resolved.insert(key, path.clone());
+                return Some(path);
+            }
+        }
+
+        let path = resolve_path(configured, env_var, auto_candidates, self.extra)?;
+        self.resolved.insert(key, path.clone());
+        Some(path)
+    }
+}
+
+/// Cache key of a tool request. The requested name is part of it so that
+/// switching compilers (or overriding one through the environment) never reuses
+/// the previous tool's path.
+fn request_key(role: &str, env_var: &str, configured: &str) -> String {
+    let requested = std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| configured.to_string());
+    format!("{role}|{env_var}={}", requested.trim())
+}
+
 fn resolve_path(
     configured: &str,
     env_var: &str,
@@ -466,15 +585,10 @@ fn lookup_or_probe(
 }
 
 fn file_stamp(path: &Path) -> (u64, Option<u64>) {
-    let Ok(meta) = fs::metadata(path) else {
-        return (0, None);
-    };
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64);
-    (meta.len(), modified)
+    match util::file_stamp(path) {
+        Some((size, modified)) => (size, Some(modified)),
+        None => (0, None),
+    }
 }
 
 fn probe_at(path: &Path) -> (Family, String) {

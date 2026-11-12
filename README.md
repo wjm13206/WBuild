@@ -2,7 +2,7 @@
 
 > **Fast. Simple. Incremental.**
 
-WBuild 是一个用 Rust 编写的现代通用构建系统。它只读取一个 `wbuild.toml`，自动发现头文件依赖，用 BLAKE3 内容指纹做精准增量，并提供本地内容寻址缓存与并行 DAG 调度。所有工具都通过 `program + args` 直接执行，**不经过 shell**。
+WBuild 是一个用 Rust 编写的现代通用构建系统。
 
 ```toml
 [project]
@@ -25,17 +25,15 @@ Finished 5 built in 514ms
 
 ## 特性
 
-- **快速**：Rust 实现，多线程并行执行，按 DAG 就绪顺序调度，并优先启动关键路径；失败后立即停止派发新任务。
-- **简单**：全部配置都在 TOML 中，无需 CMake、Make 或脚本；常见项目只需几行。
-- **精准增量**：BLAKE3 内容哈希 + 工具链身份 + 完整命令行 + 头文件依赖指纹，只重建真正受影响的步骤。
-- **本地缓存**：内容寻址对象缓存，`wbuild clean` 后仍可复用；缓存键与依赖哈希分离，回退源码/头文件也能命中已有产物。
-- **自动依赖追踪**：GCC/Clang 使用 `-MMD -MF -MP`，MSVC 使用 `/showIncludes`，rustc 使用 `--emit=dep-info`。
-- **多目标**：`exe`、`staticlib`、`sharedlib`、`object`、`custom`、`rust`、`cargo`，目标之间用 `links` 表达依赖、链接顺序与头文件传递。
-- **工具链管理**：自动探测 GCC、Clang、MSVC、rustc、cargo、ar、NASM，支持显式路径、环境变量覆盖，以及按目标选择 `[toolchain.<name>]` 预设或 `compiler = "musl-gcc"`。
-- **灵活的自定义步骤**：`custom` 目标支持 `workdir`、`stdout` 重定向、多产物具名引用，`wbuild run` 可直接运行其 `program`。
-- **可诊断**：`--explain`、`--dry-run`、`--print-commands`、`--timings`、`wbuild doctor`、`wbuild graph`、`wbuild profile`、`wbuild cache`。
-- **跨平台**：Windows / Linux / macOS；支持交叉编译目标三元组与 sysroot。
-- **无 Shell**：命令始终以 `Command::new(program).args(args)` 执行，参数不会被二次解析，跨平台且安全。
+- **快速**
+- **简单**
+- **精准增量**
+- **本地缓存**
+- **自动依赖追踪**
+- **多目标**
+- **工具链管理**
+- **灵活的自定义步骤**
+- **跨平台**
 
 ## 安装
 
@@ -45,11 +43,7 @@ cargo install --path .
 cargo build --release
 ```
 
-需要 Rust 1.89 或更新版本（构建锁使用标准库的文件锁 API）。
-
-编译产物为 `target/release/wbuild`（Windows 为 `wbuild.exe`）。
-
-> Windows 提示：若只安装了 MSVC 工具链但缺少 `link.exe`，请改用 GNU 工具链：`rustup default stable-x86_64-pc-windows-gnu`，或在构建时设置 `RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu`。
+需要 Rust 1.89 或更新版本
 
 ## 快速开始
 
@@ -71,7 +65,7 @@ wbuild build -p release     # 优化构建
 | `wbuild rebuild [TARGET...]` | 先清理再构建 |
 | `wbuild run [TARGET] -- [ARGS...]` | 构建后运行可执行产物；`custom` 目标则先构建其 `links`，再运行 `program + args`，`--` 之后的参数原样传入 |
 | `wbuild test [TARGET...]` | 构建并运行所有 `test = true` 的目标 |
-| `wbuild clean [--all]` | 删除输出目录；`--all` 同时删除状态与缓存 |
+| `wbuild clean [--all]` | 删除输出目录；`--all` 同时删除状态、哈希索引与缓存 |
 | `wbuild list` | 列出目标与依赖 |
 | `wbuild configure` | 打印解析后的 profile、路径与目标，不执行构建 |
 | `wbuild profile` | 读取 `.wbuild/timings.json`，列出最慢的步骤 |
@@ -86,253 +80,7 @@ wbuild build -p release     # 优化构建
 
 全局选项：`-C/--directory DIR`、`-f/--file FILE`、`-j/--jobs N`、`-p/--profile NAME`、`-v/--verbose`、`-q/--quiet`、`--no-color`。
 
-## 配置参考
-
-### `[project]`
-
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `name` | 必填 | 项目名 |
-| `version` | `"0.1.0"` | 版本号 |
-| `root` | `"."` | 项目根目录（相对于配置文件） |
-| `out_dir` | `"build"` | 构建产物目录 |
-| `description` | 无 | 项目描述 |
-
-### `[build]`
-
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `profile` | `"debug"` | 默认构建配置 |
-| `jobs` | `0` | 并行任务数，`0` 表示自动检测 |
-| `cache` | `true` | 启用本地对象缓存 |
-| `state_dir` | `".wbuild"` | 状态、缓存与依赖文件目录 |
-| `timings` | `false` | 总是记录性能报告 |
-
-### `[compiler]`
-
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `cc` / `cxx` / `rustc` / `asm` / `ar` / `linker` | `"auto"` | 工具路径或名称；`auto` 自动探测 |
-| `target` | 无 | 全局目标三元组，例如 `aarch64-linux-gnu` |
-| `sysroot` | 无 | 交叉编译 sysroot |
-| `extra_paths` | `[]` | 探测工具时优先搜索的目录 |
-| `defines` | `[]` | 全局宏定义，如 `["FOO=1"]` |
-| `include` | `[]` | 全局头文件目录 |
-| `cflags` / `cxxflags` / `asmflags` / `rustflags` / `ldflags` | `[]` | 全局编译/链接参数 |
-
-工具探测顺序：环境变量 `WBUILD_CC`、`WBUILD_CXX`、`WBUILD_RUSTC`、`WBUILD_ASM`、`WBUILD_AR`、`WBUILD_LINKER` → 配置中的显式路径 → `extra_paths` → `PATH`。交叉编译时会优先尝试带三元组前缀的工具（如 `aarch64-linux-gnu-gcc`）。
-
-### `[toolchain.<name>]`
-
-可复用的工具链预设。目标通过 `toolchain = "<name>"` 选择；未设置的字段沿用全局 `[compiler]`。
-
-```toml
-[toolchain.musl]
-compiler = "musl-gcc"       # 同时设置 cc 与 linker，并推导 cxx
-target = "x86_64-linux-musl"
-sysroot = "/opt/musl"
-
-[target.linux_app]
-kind = "exe"
-sources = ["userland/linux/*.c"]
-toolchain = "musl"
-ldflags = ["-static-pie"]
-```
-
-字段：`compiler`（`cc` + `linker` 简写）、`cc`、`cxx`、`rustc`、`asm`、`ar`、`linker`、`target`、`sysroot`、`extra_paths`。每个目标也可以直接写 `compiler = "musl-gcc"` 或 `cc`/`cxx`/`linker` 等字段覆盖单个工具；不同工具链的指纹相互独立，切换工具会触发对应的重建。
-
-### `[profiles.<name>]`
-
-内置 `debug`（`-O0 -g`）与 `release`（`-O2`、无调试信息、定义 `NDEBUG`）。自定义配置可通过 `extends` 继承。
-
-| 字段 | 说明 |
-| --- | --- |
-| `extends` | 继承的配置名 |
-| `opt` | 优化级别：`0`/`1`/`2`/`3`/`s`/`z` |
-| `debug` | 是否生成调试信息 |
-| `lto` | 是否启用 LTO（GCC/Clang `-flto`，rustc `-Clto=thin`） |
-| `defines` / `cflags` / `cxxflags` / `asmflags` / `rustflags` / `ldflags` | 该配置附加参数 |
-
-### `[target.<name>]`
-
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `kind` | `"exe"` | `exe`、`staticlib`、`sharedlib`、`object`、`custom`、`rust`、`cargo` |
-| `sources` | `[]` | 文件、目录（递归）或 glob；`object` 目标编译后不链接 |
-| `exclude` | `[]` | 从源集合中排除的 glob/目录 |
-| `include` | `[]` | 头文件目录；会沿 `links` 传递给消费者 |
-| `defines` | `[]` | 目标级宏定义 |
-| `cflags` / `cxxflags` / `asmflags` / `rustflags` / `ldflags` | `[]` | 目标级参数 |
-| `links` | `[]` | 依赖的其他 WBuild 目标 |
-| `libs` | `[]` | 系统库，如 `["m", "pthread"]` |
-| `lib_dirs` | `[]` | 系统库搜索目录 |
-| `cxx_std` | 无 | C++ 标准，如 `"17"`、`"20"` |
-| `output` | 自动 | 显式产物路径（相对于 `out_dir`）；`object` 目标也可指定，但要求恰好一个源文件 |
-| `target` | 无 | 目标级交叉编译三元组 |
-| `toolchain` | 无 | 引用 `[toolchain.<name>]` 预设 |
-| `compiler` | 无 | 同时覆盖 `cc` 与 `linker`，并按名称推导 `cxx`（`gcc`→`g++` 等） |
-| `cc` / `cxx` / `asm` / `ar` / `linker` | 无 | 覆盖单个工具 |
-| `workdir` | 项目根 | `custom` 步骤的工作目录（相对项目根） |
-| `stdout` | 无 | 把 `custom` 步骤的标准输出重定向到该文件 |
-| `asm_format` | 按平台 | NASM 输出格式，如 `elf64`、`win64`、`macho64`、`bin` |
-| `env` | `{}` | 执行该目标步骤时附加的环境变量 |
-| `test` | `false` | 标记为测试可执行文件，供 `wbuild test` 运行 |
-
-Rust 专用：`edition`（默认 `"2021"`）、`crate_type`（`bin`、`staticlib`、`cdylib`、`rlib`、`dylib`）。
-
-Cargo 专用：`manifest`（必需，`Cargo.toml` 路径）、`features`、`cargo_args`。
-
-Custom 专用：`program`（必需，名称或路径，也可以指向其他目标的声明产物）、`args`、`inputs`（参与指纹的输入文件/glob）、`outputs`（首个为主产物；可用 `stdout` 代替）、`workdir`、`stdout`。所有参数直接传给程序，不经过 shell。`program` 指向尚未生成的声明产物时，规划阶段会放行；请通过 `links` 保证它先被构建。
-
-## 示例
-
-### C 可执行文件 + 静态库
-
-```toml
-[project]
-name = "hello"
-out_dir = "build"
-
-[target.app]
-kind = "exe"
-sources = ["src/**/*.c"]
-include = ["include"]
-links = ["core"]
-
-[target.core]
-kind = "staticlib"
-sources = ["core/*.c"]
-include = ["core/include"]
-
-[profiles.release]
-opt = 2
-debug = false
-cflags = ["-Wall", "-Wextra"]
-```
-
-`app` 会自动获得 `core` 的 `include` 目录、链接 `libcore.a`，并保证构建顺序。动态库依赖还会自动加入运行期 rpath。
-
-### C++ 共享库
-
-```toml
-[target.engine]
-kind = "sharedlib"
-sources = ["engine/**/*.cpp"]
-include = ["engine/include"]
-cxx_std = "20"
-libs = ["m"]
-
-[target.tool]
-kind = "exe"
-sources = ["tools/*.cpp"]
-links = ["engine"]
-```
-
-### Assembly
-
-```toml
-[target.start]
-kind = "staticlib"
-sources = ["asm/*.asm"]
-asmflags = ["-g"]
-```
-
-`asm` 工具自动使用 NASM 时，WBuild 会根据目标平台添加 `-f win64` / `elf64` / `macho64`。
-
-### 直接使用 rustc
-
-```toml
-[target.app]
-kind = "rust"
-sources = ["src/main.rs"]
-edition = "2021"
-target = "x86_64-pc-windows-gnu"   # 需要对应的 Rust 标准库
-```
-
-### 包装 Cargo 项目
-
-```toml
-[target.app]
-kind = "cargo"
-manifest = "crate/Cargo.toml"
-features = ["cli"]
-```
-
-WBuild 调用 `cargo build`，并把生成的可执行文件复制到 `build/<profile>/<name>[.exe]`。
-
-### 对象文件目标
-
-```toml
-[target.piece]
-kind = "object"
-sources = ["src/piece.c"]
-
-[target.app]
-kind = "exe"
-sources = ["src/main.c"]
-links = ["piece"]
-```
-
-`object` 目标只编译不链接；对象文件写入 `build/<profile>/obj/<target>/`，并会被下游可执行文件或静态库自动加入链接输入。指定 `output` 时，编译结果直接写入该路径（要求恰好一个源文件），例如把 NASM 汇编成裸二进制：
-
-```toml
-[target.smp_tramp]
-kind = "object"
-sources = ["arch/x86_64/boot/smp_trampoline.nasm"]
-asm_format = "bin"
-output = "smp_trampoline.bin"
-```
-
-非链接产物（如 `.bin`）不会被自动加入链接输入；需要 `.o` 时可用一个 `objcopy` 的 `custom` 目标引用它。
-
-### 具名产物与多产物目标
-
-每个 `outputs` 条目都会注册为 `<target>:<路径>` 和 `<target>:<文件名>` 两种具名产物，可直接写进 `links`：
-
-```toml
-[target.userland]
-kind = "custom"
-program = "build-userland"
-outputs = ["out/init.elf", "out/init_elf.o"]
-
-[target.kernel]
-kind = "exe"
-sources = ["src/*.c"]
-links = ["userland:out/init_elf.o"]
-```
-
-具名产物只有扩展名为 `.o`/`.obj`/`.a`/`.lib`/`.so`/`.dylib`/`.dll`/`.rlib` 时才会自动进入链接输入；`.elf`、`.bin` 等仍需通过 `ldflags` 或 `objcopy` 显式处理。
-
-### 自定义目标
-
-```toml
-[target.gen]
-kind = "custom"
-program = "protoc"
-args = ["--cpp_out=gen", "proto/api.proto"]
-inputs = ["proto/api.proto"]
-outputs = ["gen/api.pb.cc", "gen/api.pb.h"]
-
-[target.app]
-sources = ["src/*.cc", "gen/api.pb.cc"]
-include = ["gen"]
-links = ["gen"]
-```
-
-`program` 可以是 `PATH` 中的名称、相对于项目根的路径，或其他目标声明的产物。`inputs`（以及 `sources`）参与指纹，任一输入变化都会重新运行；`outputs` 的首项作为主产物，其余作为附加产物一起检查并缓存。其他目标通过 `links` 依赖 `gen` 后，可以直接把 `gen` 声明的输出写进自己的 `sources`/`include`——即使这些文件在首次规划时还不存在，WBuild 也会先完成生成步骤再编译消费者。
-
-需要把命令的标准输出保存成文件时，用 `stdout` 代替 `outputs`（也可以同时使用，`stdout` 会成为附加产物）：
-
-```toml
-[target.system_map]
-kind = "custom"
-program = "nm"
-args = ["-n", "out/kernel"]
-stdout = "out/System.map"
-links = ["kernel"]
-```
-
-`workdir` 可以改变 `custom` 步骤的工作目录，适合 `objcopy` 这类必须在输入文件所在目录执行的工具。`wbuild run <custom>` 只构建它的 `links`，然后直接运行 `program + args`，不会把 `custom` 步骤本身再执行一次。
+详细命令行说明请参阅：[命令行参考](docs/cli.md)。
 
 ### 测试目标
 
@@ -354,112 +102,34 @@ all 1 test target(s) passed
 
 没有标记任何 `test = true` 时，`wbuild test` 会给出明确错误。
 
-### 交叉编译
-
-```toml
-[compiler]
-target = "aarch64-linux-gnu"
-cc = "aarch64-linux-gnu-gcc"
-cxx = "aarch64-linux-gnu-g++"
-ar = "aarch64-linux-gnu-ar"
-sysroot = "/opt/sysroot/aarch64"
-```
-
-也可以在单个目标上用 `target = "..."` 覆盖。
-
-## 增量与缓存原理
-
-每个步骤的指纹由以下内容组成：
-
-1. 工具链身份（编译器路径、版本、目标三元组、sysroot）；使用 `toolchain`/`compiler` 覆盖的目标使用自己的工具链指纹；
-2. 步骤种类、程序路径、完整参数、环境变量、工作目录与输出路径；
-3. 所有静态输入文件的内容哈希（源文件等）；
-4. 上一次构建发现的所有头文件/依赖文件路径及其**内容哈希**。
-
-构建前用记录的依赖集合计算 `fp_pre`，与状态文件中保存的构建后指纹比较：完全一致且产物存在即 `up-to-date`，否则只重新执行该步骤。
-
-缓存采用两级结构：
-
-- **命令指纹**（不含依赖）索引多个构建变体；
-- 每个变体记录依赖集合的哈希、主产物指纹以及所有附加产物指纹；
-- 查找时先用当前依赖内容验证哈希，再原子地恢复主产物和全部附加产物；任一附加产物缺失都视为未命中。
-
-因此：
-
-- 修改头文件 → 只重建包含它的编译单元及下游链接步骤；
-- 内容未变化的文件（例如只改注释）不会触发不必要的链接；
-- 撤销一次修改 → 可直接命中此前缓存的产物；
-- `wbuild clean`（保留 `.wbuild/cache`）后再次构建 → 仍能命中缓存。
-
-状态与缓存写入均使用临时文件 + 原子替换；同一项目同时只允许一个构建进程（操作系统文件锁，进程退出后自动释放，崩溃或中断不会留下需要手工删除的死锁）。缺失的依赖文件会使指纹失配并触发重建，避免使用过期产物。
-
-每个缓存对象都附带记录 BLAKE3 与长度的元数据。恢复前先校验：长度不符或内容被篡改的对象会被删除并当作未命中，回退到真实构建；损坏的索引 JSON 同样视为空索引，不会中断构建。旧版本留下、没有元数据的对象会在下一次构建时重新生成。
-
 ## 架构
 
-| 模块 | 职责 |
-| --- | --- |
-| `cli` | 命令行解析与子命令分派 |
-| `config` | TOML 配置模型、默认值、profile 继承与校验 |
-| `toolchain` | 编译器/链接器探测、版本识别、交叉编译 |
-| `plan` | 将目标转换为具体步骤与依赖 DAG |
-| `graph` | DAG 校验与拓扑排序 |
-| `exec` | 并行调度、指纹、缓存、依赖收集 |
-| `state` | 增量状态持久化与构建锁 |
-| `cache` | 内容寻址缓存与依赖变体索引 |
-| `hash` | BLAKE3 指纹与文件哈希记忆化 |
-| `depfile` | Make 风格 depfile 与 MSVC `/showIncludes` 解析 |
-| `engine` | 构建流程编排、运行/测试、配置与缓存诊断、清理/列表/图/初始化 |
-| `watch` | 源文件轮询与自动重建 |
-| `util` | 路径、原子写入、进程执行、终端颜色等工具 |
-
-## 开发与测试
-
-```console
-cargo test
-cargo clippy --all-targets
-```
-
-测试包含单元测试、库 API 测试（`tests/lib.rs`，直接调用 `Config`/`Planner`/`Cache`/`hash`）与端到端 CLI 测试；依赖 C 编译器的测试在缺少编译器时会自动跳过。
-
-本仓库的示例：
-
-- `examples/hello`：C 可执行文件 + 静态库，多目标、头文件传递、debug/release。
-- `examples/rust-hello`：直接使用 `rustc` 构建。
-- `examples/cargo-hello`：包装现有 Cargo 项目。
+WBuild 由 `cli`、`config`、`toolchain`、`plan`、`graph`、`exec`、`state`、`cache`、`hash`、`depfile`、`engine`、`watch`、`util` 等模块组成，详见：[架构](docs/architecture.md)。
 
 ## 基准测试
 
-`bench/run-bench.ps1` 生成同一个包含 120 个 C 翻译单元的项目，分别用 Make、Ninja、CMake+Ninja 与 WBuild 构建，取 3 次运行的中位数。完整数据与机器信息见 [`bench/RESULTS.md`](bench/RESULTS.md)。
-
-实测环境：Intel Core 5 120U（12 逻辑核）、Windows、gcc 16.1.0（MinGW-W64 UCRT）、Ninja 1.13.2、CMake 4.4.1；统一使用 `-j 12` 与 `-O0 -g`。
-
 | 工具 | 冷构建 | 无改动重建 | 单文件增量 |
 | --- | ---: | ---: | ---: |
-| Make | 4797 ms | 504 ms | 732 ms |
-| Ninja | 4567 ms | 28 ms | 400 ms |
-| CMake + Ninja | 4836 ms | 342 ms | 755 ms |
-| **WBuild** | **4679 ms** | **82 ms** | **205 ms** |
+| Make | 4008 ms | 205 ms | 456 ms |
+| Ninja | 4092 ms | 31 ms | 321 ms |
+| CMake + Ninja | 4318 ms | 386 ms | 714 ms |
+| **WBuild** | **4013 ms** | **77 ms** | **187 ms** |
 
-冷构建与 Ninja 相差约 2%，差距主要来自 BLAKE3 内容指纹与依赖收集。无改动重建需要校验全部输入内容，因此慢于 Ninja（82 ms 对 28 ms），但仍远快于 Make 与 CMake+Ninja；单文件增量约为 Ninja 的 0.5 倍。`wbuild clean` 保留缓存后再构建耗时 199 ms，产物全部从本地缓存恢复并通过 BLAKE3 校验。
+详见：[基准测试](docs/benchmarks.md)。
 
-复现：
+## 完整文档
 
-```console
-cargo build --release
-powershell -ExecutionPolicy Bypass -File bench/run-bench.ps1 -Sources 120 -Runs 3
-```
+全部中文文档位于 `docs/` 目录：
 
-脚本只测量真实墙钟时间（包含进程启动），WBuild 冷构建使用 `--no-cache` 以保证对比公平；系统中没有可用 Make 时会自动跳过该行。
+- [快速开始](docs/getting-started.md)
+- [配置参考](docs/configuration.md)
+- [示例集](docs/cookbook.md)
+- [命令行参考](docs/cli.md)
+- [增量与缓存](docs/incrementality.md)
+- [架构](docs/architecture.md)
+- [基准测试](docs/benchmarks.md)
+- [开发](docs/development.md)
 
-## 设计约束
-
-- 配置只使用 TOML，不依赖 Make/CMake；`custom` 目标以 `program + args` 直接执行，不经过 shell。
-- 不依赖 Make/CMake 作为构建引擎。
-- 绝不拼接 shell 命令；每个参数单独传递。
-- 增量正确性优先于缓存命中率：任何不确定因素都会导致重建。
-- 依赖精简，核心只依赖 `anyhow`、`blake3`、`clap`、`crossbeam-channel`、`glob`、`serde`、`serde_json`、`toml`、`walkdir`。
-
----
+索引页：[docs/README.md](docs/README.md)
 
 **WBuild — Fast. Simple. Incremental.**

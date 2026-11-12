@@ -1,6 +1,6 @@
 ﻿# WBuild Benchmark Results
 
-Generated: 2026-11-08 23:06:56
+Generated: 2026-11-12 14:44:47
 
 | Item | Value |
 | --- | --- |
@@ -15,16 +15,16 @@ Generated: 2026-11-08 23:06:56
 
 | Tool | Cold build | No-op rebuild | 1-file incremental |
 | --- | ---: | ---: | ---: |
-| Make | 4796.6 ms | 504.2 ms | 731.5 ms |
-| Ninja | 4567.4 ms | 28.1 ms | 400.3 ms |
-| CMake+Ninja | 4836.3 ms | 342.2 ms | 754.8 ms |
-| WBuild | 4678.9 ms | 81.9 ms | 204.5 ms |
+| Make | 4008.1 ms | 205.2 ms | 456.1 ms |
+| Ninja | 4092.1 ms | 30.6 ms | 321.4 ms |
+| CMake+Ninja | 4317.5 ms | 385.8 ms | 714.2 ms |
+| WBuild | 4013.2 ms | 77.2 ms | 186.5 ms |
 
-WBuild clean (outputs removed, cache kept) then build: **199.4 ms**.
+WBuild clean (outputs removed, cache kept) then build: **199.9 ms**.
 
 Notes:
 
 - All builds compile the same generated project with `gcc -O0 -g` and `-j 12`.
 - WBuild cold builds run with --no-cache for a fair comparison; the cache-reuse line measures the restore path.
-- CMake configure (cmake -G Ninja) took 1179.2 ms once and is excluded from build timings.
+- CMake configure (cmake -G Ninja) took 1089.9 ms once and is excluded from build timings.
 - Timings include process startup. Only wall-clock build time is measured; no synthetic sleeps.

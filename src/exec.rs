@@ -250,7 +250,7 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
 
     // Stat the outputs at most once per step; the answer is reused by both the
     // rebuild reason and the up-to-date decision.
-    let outputs_present = !ctx.options.force && record.is_some() && outputs_exist(step);
+    let outputs_present = !ctx.options.force && record.is_some() && outputs_exist(step, ctx);
     let reason = if ctx.options.force {
         "forced rebuild"
     } else if record.is_none() {
@@ -317,7 +317,15 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
                 continue;
             }
             match restore_cached(step, &cached, &cached_extras) {
-                Ok(()) if outputs_exist(step) => {
+                Ok(()) if {
+                    // The restore just rewrote the outputs, so drop the stamps
+                    // memoized from the pre-restore check and look again.
+                    ctx.hasher.invalidate(&step.output);
+                    for extra in &step.extra_outputs {
+                        ctx.hasher.invalidate(extra);
+                    }
+                    outputs_exist(step, ctx)
+                } => {
                     let fp_post = if entry.deps.as_slice() == prev_deps {
                         fp_pre.clone()
                     } else {
@@ -340,6 +348,16 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
                 }
             }
         }
+    }
+
+    // Everything below may rewrite the step's outputs, so any stamp verified
+    // earlier in this build is no longer trustworthy.
+    ctx.hasher.invalidate(&step.output);
+    for extra in &step.extra_outputs {
+        ctx.hasher.invalidate(extra);
+    }
+    if let Some(stdout) = &step.stdout {
+        ctx.hasher.invalidate(stdout);
     }
 
     if let Err(err) = ensure_parents(step) {
@@ -464,8 +482,15 @@ fn execute_step(step: &Step, ctx: &ExecContext<'_>) -> StepOutcome {
     outcome
 }
 
-fn outputs_exist(step: &Step) -> bool {
-    step.output.is_file() && step.extra_outputs.iter().all(|p| p.is_file())
+fn outputs_exist(step: &Step, ctx: &ExecContext<'_>) -> bool {
+    // Existence is answered from the hasher's stamp memo, which is also what the
+    // fingerprint uses. A step's outputs are therefore stat'ed once per build
+    // (and not at all when another step already stamped them), instead of twice.
+    ctx.hasher.exists(&step.output)
+        && step
+            .extra_outputs
+            .iter()
+            .all(|p| ctx.hasher.exists(p))
 }
 
 fn ensure_parents(step: &Step) -> std::io::Result<()> {
@@ -530,6 +555,10 @@ fn restore_cached(step: &Step, cached: &Path, cached_extras: &[PathBuf]) -> Resu
 }
 
 /// Compute the fingerprint for a step given its dependency set (stored paths).
+///
+/// File contents come from [`crate::hash::FileHasher`], which memoizes both the
+/// stamp and the hash of every path, so overlapping inputs and dependencies
+/// cost one lookup each instead of one syscall each.
 fn compute_fingerprint(step: &Step, deps: &[String], ctx: &ExecContext<'_>) -> Result<String> {
     let mut fp = Fingerprint::new().tag("wbuild-step-v2");
     fp.text(step.toolchain_fp.as_deref().unwrap_or(&ctx.toolchain_fp));

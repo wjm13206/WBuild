@@ -1,6 +1,6 @@
 [package]
 name = "wbuild"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "WBuild - Fast. Simple. Incremental. A modern general-purpose build system."
 license = "MIT"
