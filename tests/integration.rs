@@ -293,7 +293,11 @@ fn inspection_commands_report_state() {
 
     let version = run(dir.path(), &["version"]);
     assert!(version.status.success());
-    assert!(stdout(&version).contains("WBuild 0.1.0"));
+    assert!(
+        stdout(&version).contains(&format!("WBuild {}", env!("CARGO_PKG_VERSION"))),
+        "unexpected version output:\n{}",
+        stdout(&version)
+    );
 
     let build = run(dir.path(), &["build", "--timings"]);
     assert!(build.status.success(), "{}", stderr(&build));
